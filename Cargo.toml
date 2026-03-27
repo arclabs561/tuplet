@@ -1,15 +1,15 @@
 [workspace]
 
 [package]
-name = "contrastive"
+name = "mahala"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Contrastive learning losses and hard negative mining for embedding training"
+description = "Metric learning from Mahalanobis to InfoNCE: distance learning, contrastive losses, and hard negative mining"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/arclabs561/contrastive"
+repository = "https://github.com/arclabs561/mahala"
 categories = ["science", "algorithms"]
-keywords = ["contrastive-learning", "triplet-loss", "metric-learning", "embedding", "infonce"]
+keywords = ["mahalanobis", "metric-learning", "contrastive-learning", "triplet-loss", "infonce"]
 
 [dependencies]
 thiserror = "2.0"
