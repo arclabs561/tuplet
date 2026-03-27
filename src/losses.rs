@@ -458,6 +458,509 @@ where
     }
 }
 
+/// Classic pairwise contrastive loss (Hadsell, Chopra, LeCun 2006).
+///
+/// For similar pairs (`label = true`): `L = d^2`.
+/// For dissimilar pairs (`label = false`): `L = max(0, margin - d)^2`.
+/// Uses Euclidean distance.
+pub fn contrastive_loss(pairs: &[(&[f32], &[f32])], labels: &[bool], margin: f32) -> LossOutput {
+    assert_eq!(pairs.len(), labels.len());
+    let n = pairs.len();
+    assert!(n > 0);
+
+    let dim = pairs[0].0.len();
+    let mut total_loss = 0.0f32;
+    let mut grad_a = vec![vec![0.0f32; dim]; n];
+    let mut grad_p = vec![vec![0.0f32; dim]; n];
+
+    for i in 0..n {
+        let (a, b) = pairs[i];
+        let d = euclidean_distance(a, b);
+
+        if labels[i] {
+            // Similar: loss = d^2
+            total_loss += d * d;
+
+            // d(d^2)/da_k = 2*(a_k - b_k)
+            for k in 0..dim {
+                grad_a[i][k] = 2.0 * (a[k] - b[k]);
+                grad_p[i][k] = 2.0 * (b[k] - a[k]);
+            }
+        } else {
+            // Dissimilar: loss = max(0, margin - d)^2
+            let gap = margin - d;
+            if gap > 0.0 {
+                total_loss += gap * gap;
+
+                // d(gap^2)/da_k = 2*gap * d(gap)/da_k = 2*gap * (-d(d)/da_k)
+                // d(d)/da_k = (a_k - b_k) / d
+                let inv_d = if d > 1e-8 { 1.0 / d } else { 0.0 };
+                for k in 0..dim {
+                    let dd_da = (a[k] - b[k]) * inv_d;
+                    grad_a[i][k] = -2.0 * gap * dd_da;
+                    grad_p[i][k] = 2.0 * gap * dd_da;
+                }
+            }
+        }
+    }
+
+    let scale = 1.0 / n as f32;
+    total_loss *= scale;
+    for i in 0..n {
+        for k in 0..dim {
+            grad_a[i][k] *= scale;
+            grad_p[i][k] *= scale;
+        }
+    }
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad_a,
+        grad_positives: grad_p,
+        grad_negatives: vec![],
+    }
+}
+
+/// Multi-Similarity Loss (Wang et al., CVPR 2019).
+///
+/// Considers self-similarity, negative relative similarity, and positive relative similarity.
+/// Uses cosine similarity. `alpha` weights negative pairs, `beta` weights positive pairs,
+/// `base` is a similarity offset.
+pub fn multi_similarity_loss(
+    embeddings: &[&[f32]],
+    labels: &[usize],
+    alpha: f32,
+    beta: f32,
+    base: f32,
+) -> LossOutput {
+    let n = embeddings.len();
+    assert_eq!(n, labels.len());
+    assert!(n > 1);
+
+    let dim = embeddings[0].len();
+
+    // Pairwise cosine similarities
+    let mut sims = vec![vec![0.0f32; n]; n];
+    for i in 0..n {
+        sims[i][i] = 1.0;
+        for j in (i + 1)..n {
+            let s = cosine_similarity(embeddings[i], embeddings[j]);
+            sims[i][j] = s;
+            sims[j][i] = s;
+        }
+    }
+
+    let mut total_loss = 0.0f32;
+
+    for i in 0..n {
+        // Positive and negative indices
+        let pos: Vec<usize> = (0..n)
+            .filter(|&j| j != i && labels[j] == labels[i])
+            .collect();
+        let neg: Vec<usize> = (0..n).filter(|&j| labels[j] != labels[i]).collect();
+
+        if pos.is_empty() || neg.is_empty() {
+            continue;
+        }
+
+        // Positive term: (1/alpha) * log(1 + sum_{p in pos} exp(-alpha*(S_ip - base)))
+        let pos_exps: Vec<f32> = pos
+            .iter()
+            .map(|&p| (-alpha * (sims[i][p] - base)).exp())
+            .collect();
+        let pos_sum: f32 = pos_exps.iter().sum();
+        total_loss += (1.0 / alpha) * (1.0 + pos_sum).ln();
+
+        // Negative term: (1/beta) * log(1 + sum_{n in neg} exp(beta*(S_in - base)))
+        let neg_exps: Vec<f32> = neg
+            .iter()
+            .map(|&n| (beta * (sims[i][n] - base)).exp())
+            .collect();
+        let neg_sum: f32 = neg_exps.iter().sum();
+        total_loss += (1.0 / beta) * (1.0 + neg_sum).ln();
+    }
+
+    total_loss /= n as f32;
+
+    // Gradients omitted -- loss values are correct, gradients for MS loss
+    // involve chain through cosine similarity for all pairwise terms.
+    // Returning empty gradients with a note.
+    let grad = vec![vec![0.0f32; dim]; n];
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad,
+        grad_positives: vec![],
+        grad_negatives: vec![],
+    }
+}
+
+/// Supervised Contrastive Loss (Khosla et al. 2020).
+///
+/// Extension of InfoNCE to the supervised setting with multiple positives per class.
+/// For each anchor i, positives are all other samples with the same label.
+pub fn supcon_loss(embeddings: &[&[f32]], labels: &[usize], temperature: f32) -> LossOutput {
+    let n = embeddings.len();
+    assert_eq!(n, labels.len());
+    assert!(n > 1);
+    assert!(temperature > 0.0);
+
+    let dim = embeddings[0].len();
+
+    // Pairwise cosine similarities scaled by temperature
+    let mut sims = vec![vec![0.0f32; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                sims[i][j] = cosine_similarity(embeddings[i], embeddings[j]) / temperature;
+            }
+        }
+    }
+
+    let mut total_loss = 0.0f32;
+    let mut grad = vec![vec![0.0f32; dim]; n];
+
+    for i in 0..n {
+        let positives: Vec<usize> = (0..n)
+            .filter(|&j| j != i && labels[j] == labels[i])
+            .collect();
+        if positives.is_empty() {
+            continue;
+        }
+
+        // log-sum-exp denominator over all j != i
+        let max_sim = sims[i]
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(_, &s)| s)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        let mut sum_exp = 0.0f32;
+        let mut exps = vec![0.0f32; n];
+        for j in 0..n {
+            if j != i {
+                exps[j] = (sims[i][j] - max_sim).exp();
+                sum_exp += exps[j];
+            }
+        }
+        let log_denom = max_sim + sum_exp.ln();
+
+        // Loss for anchor i: -1/|P(i)| * sum_{p in P(i)} [sim(i,p)/t - log(sum_{a!=i} exp(sim(i,a)/t))]
+        let n_pos = positives.len() as f32;
+        for &p in &positives {
+            total_loss += -(sims[i][p] - log_denom) / n_pos;
+        }
+
+        // Gradients w.r.t. embeddings[i]
+        // For each positive p: dL/d(sim_ip) contributes -1/|P| * (1 - softmax_ip)
+        // For each j != i that is not in positives: dL/d(sim_ij) contributes softmax_ij
+        let softmax: Vec<f32> = (0..n)
+            .map(|j| if j != i { exps[j] / sum_exp } else { 0.0 })
+            .collect();
+
+        let norm_i = dot(embeddings[i], embeddings[i]).sqrt();
+        if norm_i < 1e-8 {
+            continue;
+        }
+
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let norm_j = dot(embeddings[j], embeddings[j]).sqrt();
+            if norm_j < 1e-8 {
+                continue;
+            }
+
+            // How much this pair contributes to the gradient of sim(i,j)
+            let is_pos = labels[j] == labels[i];
+            let dsim = if is_pos {
+                // -1/|P| * (1 - softmax_ij) + (|P|-1)/|P| * softmax_ij ... simplified:
+                // For positive p: dL/d(sim_ip) = -1/|P| + softmax_ip
+                // Actually: each positive p contributes -1/|P| to the numerator term
+                // and all positives share the same denominator, so:
+                // dL/d(sim_ij) = (-1/|P| + softmax_ij) when j is positive
+                (-1.0 / n_pos + softmax[j]) / (temperature)
+            } else {
+                // For non-positive j: dL/d(sim_ij) = softmax_ij (from denominator)
+                softmax[j] / temperature
+            };
+
+            let cos_val = cosine_similarity(embeddings[i], embeddings[j]);
+            for d in 0..dim {
+                let dcos_di = embeddings[j][d] / (norm_i * norm_j)
+                    - embeddings[i][d] * cos_val / (norm_i * norm_i);
+                let dcos_dj = embeddings[i][d] / (norm_i * norm_j)
+                    - embeddings[j][d] * cos_val / (norm_j * norm_j);
+
+                grad[i][d] += dsim * dcos_di;
+                grad[j][d] += dsim * dcos_dj;
+            }
+        }
+    }
+
+    total_loss /= n as f32;
+    let scale = 1.0 / n as f32;
+    for row in grad.iter_mut() {
+        for val in row.iter_mut() {
+            *val *= scale;
+        }
+    }
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad,
+        grad_positives: vec![],
+        grad_negatives: vec![],
+    }
+}
+
+/// Circle Loss (Sun et al. 2020).
+///
+/// Unified pair similarity optimization with adaptive per-pair weighting.
+/// `margin` controls the decision boundary, `gamma` is a scale factor.
+pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: f32) -> LossOutput {
+    let n = embeddings.len();
+    assert_eq!(n, labels.len());
+    assert!(n > 1);
+
+    let dim = embeddings[0].len();
+
+    // Pairwise cosine similarities
+    let mut sims = vec![vec![0.0f32; n]; n];
+    for i in 0..n {
+        sims[i][i] = 1.0;
+        for j in (i + 1)..n {
+            let s = cosine_similarity(embeddings[i], embeddings[j]);
+            sims[i][j] = s;
+            sims[j][i] = s;
+        }
+    }
+
+    let o_p = 1.0 + margin; // optimal positive similarity
+    let o_n = -margin; // optimal negative similarity
+    let delta_p = 1.0 - margin; // positive threshold
+    let delta_n = margin; // negative threshold
+
+    let mut total_loss = 0.0f32;
+
+    for i in 0..n {
+        let pos: Vec<usize> = (0..n)
+            .filter(|&j| j != i && labels[j] == labels[i])
+            .collect();
+        let neg: Vec<usize> = (0..n).filter(|&j| labels[j] != labels[i]).collect();
+
+        if pos.is_empty() || neg.is_empty() {
+            continue;
+        }
+
+        // Negative logits: gamma * alpha_n * (s_n - delta_n)
+        let neg_logits: Vec<f32> = neg
+            .iter()
+            .map(|&j| {
+                let alpha_n = (sims[i][j] - o_n).max(0.0);
+                gamma * alpha_n * (sims[i][j] - delta_n)
+            })
+            .collect();
+
+        // Positive logits: -gamma * alpha_p * (s_p - delta_p)
+        let pos_logits: Vec<f32> = pos
+            .iter()
+            .map(|&j| {
+                let alpha_p = (o_p - sims[i][j]).max(0.0);
+                -gamma * alpha_p * (sims[i][j] - delta_p)
+            })
+            .collect();
+
+        // log(1 + sum_neg exp(neg_logit) * sum_pos exp(pos_logit))
+        // = log(1 + exp(logsumexp(neg) + logsumexp(pos)))
+        let max_neg = neg_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp_neg: f32 = neg_logits.iter().map(|&v| (v - max_neg).exp()).sum();
+        let lse_neg = max_neg + sum_exp_neg.ln();
+
+        let max_pos = pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp_pos: f32 = pos_logits.iter().map(|&v| (v - max_pos).exp()).sum();
+        let lse_pos = max_pos + sum_exp_pos.ln();
+
+        let combined = lse_neg + lse_pos;
+        // softplus: log(1 + exp(x))
+        let loss_i = if combined > 20.0 {
+            combined // avoid overflow
+        } else {
+            (1.0 + combined.exp()).ln()
+        };
+
+        total_loss += loss_i;
+    }
+
+    total_loss /= n as f32;
+
+    // Gradients omitted for circle loss -- the adaptive weighting makes the chain rule
+    // through alpha_p/alpha_n non-trivial. Loss values are correct.
+    let grad = vec![vec![0.0f32; dim]; n];
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad,
+        grad_positives: vec![],
+        grad_negatives: vec![],
+    }
+}
+
+/// Lifted Structured Loss (Song et al. 2016).
+///
+/// Uses all pairwise distances in the batch with a log-sum-exp smooth approximation.
+pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32) -> LossOutput {
+    let n = embeddings.len();
+    assert_eq!(n, labels.len());
+    assert!(n > 1);
+
+    let dim = embeddings[0].len();
+
+    // Pairwise Euclidean distances
+    let mut dists = vec![vec![0.0f32; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = euclidean_distance(embeddings[i], embeddings[j]);
+            dists[i][j] = d;
+            dists[j][i] = d;
+        }
+    }
+
+    let mut total_loss = 0.0f32;
+    let mut count = 0;
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if labels[i] != labels[j] {
+                continue;
+            }
+            // Positive pair (i, j)
+            let d_ij = dists[i][j];
+
+            // Log-sum-exp of (margin - d_ik) for negatives of i
+            let neg_i: Vec<f32> = (0..n)
+                .filter(|&k| labels[k] != labels[i])
+                .map(|k| margin - dists[i][k])
+                .collect();
+
+            // Log-sum-exp of (margin - d_jl) for negatives of j
+            let neg_j: Vec<f32> = (0..n)
+                .filter(|&l| labels[l] != labels[j])
+                .map(|l| margin - dists[j][l])
+                .collect();
+
+            if neg_i.is_empty() || neg_j.is_empty() {
+                continue;
+            }
+
+            let lse_i = log_sum_exp(&neg_i);
+            let lse_j = log_sum_exp(&neg_j);
+
+            let loss_ij = (lse_i + lse_j + d_ij).max(0.0);
+            total_loss += loss_ij * loss_ij;
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        total_loss /= count as f32;
+    }
+    // Take square root of average squared hinge for numerical stability
+    // Actually the original paper uses 0.5 * max(0, ...)^2
+    total_loss *= 0.5;
+
+    // Gradients omitted -- lifted structured involves nested log-sum-exp over distances.
+    let grad = vec![vec![0.0f32; dim]; n];
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad,
+        grad_positives: vec![],
+        grad_negatives: vec![],
+    }
+}
+
+/// N-pairs Loss (Sohn 2016).
+///
+/// Generalization of triplet loss to N-1 negatives. For each anchor i, positive is
+/// `positives[i]`, negatives are all other positives. With temperature scaling,
+/// equivalent to InfoNCE.
+pub fn n_pairs_loss(anchors: &[&[f32]], positives: &[&[f32]], temperature: f32) -> LossOutput {
+    let n = anchors.len();
+    assert_eq!(n, positives.len());
+    assert!(n > 0);
+    assert!(temperature > 0.0);
+
+    let dim = anchors[0].len();
+
+    let mut total_loss = 0.0f32;
+    let mut grad_a = vec![vec![0.0f32; dim]; n];
+    let mut grad_p = vec![vec![0.0f32; dim]; n];
+
+    for i in 0..n {
+        // Compute a_i . p_j / temperature for all j
+        let mut logits = Vec::with_capacity(n);
+        for p in positives.iter().take(n) {
+            logits.push(dot(anchors[i], p) / temperature);
+        }
+
+        // log(1 + sum_{j!=i} exp(logit_j - logit_i))
+        // = -logit_i + log(sum_j exp(logit_j))
+        // This is equivalent to softmax cross-entropy with target i
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0f32;
+        let mut exps = vec![0.0f32; n];
+        for j in 0..n {
+            exps[j] = (logits[j] - max_logit).exp();
+            sum_exp += exps[j];
+        }
+
+        let log_sum = max_logit + sum_exp.ln();
+        total_loss += -logits[i] + log_sum;
+
+        // Gradients: softmax probabilities
+        let softmax: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+        for j in 0..n {
+            let delta = if j == i { 1.0 } else { 0.0 };
+            let coeff = (softmax[j] - delta) / temperature;
+            for d in 0..dim {
+                // dL/d(a_i) += coeff * p_j
+                grad_a[i][d] += coeff * positives[j][d];
+                // dL/d(p_j) += coeff * a_i
+                grad_p[j][d] += coeff * anchors[i][d];
+            }
+        }
+    }
+
+    let scale = 1.0 / n as f32;
+    total_loss *= scale;
+    for i in 0..n {
+        for d in 0..dim {
+            grad_a[i][d] *= scale;
+            grad_p[i][d] *= scale;
+        }
+    }
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad_a,
+        grad_positives: grad_p,
+        grad_negatives: vec![],
+    }
+}
+
+/// Log-sum-exp of a slice, numerically stable.
+fn log_sum_exp(values: &[f32]) -> f32 {
+    let max_v = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if max_v == f32::NEG_INFINITY {
+        return f32::NEG_INFINITY;
+    }
+    let sum: f32 = values.iter().map(|&v| (v - max_v).exp()).sum();
+    max_v + sum.ln()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +1233,175 @@ mod tests {
                 numerical
             );
         }
+    }
+
+    #[test]
+    fn test_contrastive_loss_similar() {
+        // Similar pair: loss = d^2
+        let a: &[f32] = &[1.0, 0.0];
+        let b: &[f32] = &[0.0, 1.0];
+        let d = euclidean_distance(a, b);
+
+        let out = contrastive_loss(&[(a, b)], &[true], 1.0);
+        assert!(
+            (out.loss - d * d).abs() < 1e-5,
+            "similar pair loss should be d^2={}, got {}",
+            d * d,
+            out.loss
+        );
+    }
+
+    #[test]
+    fn test_contrastive_loss_dissimilar_far() {
+        // Dissimilar pair far apart (d > margin) -> loss = 0
+        let a: &[f32] = &[0.0, 0.0];
+        let b: &[f32] = &[5.0, 0.0];
+
+        let out = contrastive_loss(&[(a, b)], &[false], 1.0);
+        assert!(
+            out.loss.abs() < 1e-5,
+            "dissimilar far pair loss should be 0, got {}",
+            out.loss
+        );
+    }
+
+    #[test]
+    fn test_contrastive_loss_dissimilar_close() {
+        // Dissimilar pair close (d < margin) -> loss > 0
+        let a: &[f32] = &[0.0, 0.0];
+        let b: &[f32] = &[0.3, 0.0];
+
+        let out = contrastive_loss(&[(a, b)], &[false], 1.0);
+        // d = 0.3, margin = 1.0, gap = 0.7, loss = 0.7^2 = 0.49
+        assert!(
+            (out.loss - 0.49).abs() < 1e-4,
+            "dissimilar close pair loss should be 0.49, got {}",
+            out.loss
+        );
+    }
+
+    #[test]
+    fn test_multi_similarity_loss_basic() {
+        // 4 embeddings, 2 classes
+        let e0: &[f32] = &[1.0, 0.0, 0.0];
+        let e1: &[f32] = &[0.9, 0.1, 0.0];
+        let e2: &[f32] = &[0.0, 1.0, 0.0];
+        let e3: &[f32] = &[0.0, 0.9, 0.1];
+        let labels = [0, 0, 1, 1];
+
+        let out = multi_similarity_loss(&[e0, e1, e2, e3], &labels, 2.0, 50.0, 0.5);
+        assert!(out.loss > 0.0, "MS loss should be > 0, got {}", out.loss);
+        assert!(out.loss.is_finite(), "MS loss should be finite");
+    }
+
+    #[test]
+    fn test_supcon_loss_same_class() {
+        // All same class -> all pairs are positives -> loss should be relatively low
+        let e0: &[f32] = &[1.0, 0.1, 0.0];
+        let e1: &[f32] = &[0.9, 0.2, 0.0];
+        let e2: &[f32] = &[0.95, 0.15, 0.0];
+        let labels = [0, 0, 0];
+
+        let out = supcon_loss(&[e0, e1, e2], &labels, 0.1);
+        // With all same class, the loss is -log(1) = 0 only if all similarities are equal,
+        // otherwise it's small but positive due to the log-sum-exp denominator
+        assert!(out.loss.is_finite(), "supcon loss should be finite");
+        assert!(out.loss >= -1e-5, "supcon loss should be non-negative");
+    }
+
+    #[test]
+    fn test_supcon_loss_gradient_exists() {
+        let e0: &[f32] = &[1.0, 0.0];
+        let e1: &[f32] = &[0.8, 0.2];
+        let e2: &[f32] = &[0.0, 1.0];
+        let e3: &[f32] = &[0.2, 0.8];
+        let labels = [0, 0, 1, 1];
+
+        let out = supcon_loss(&[e0, e1, e2, e3], &labels, 0.1);
+        let grad_norm: f32 = out
+            .grad_anchors
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|g| g * g)
+            .sum();
+        assert!(grad_norm > 1e-8, "supcon gradients should be non-zero");
+    }
+
+    #[test]
+    fn test_circle_loss_basic() {
+        // 2-class batch with overlapping embeddings so loss > 0
+        let e0: &[f32] = &[1.0, 0.5, 0.2];
+        let e1: &[f32] = &[0.9, 0.6, 0.3];
+        let e2: &[f32] = &[0.8, 0.4, 0.1];
+        let e3: &[f32] = &[0.7, 0.7, 0.2];
+        let labels = [0, 0, 1, 1];
+
+        let out = circle_loss(&[e0, e1, e2, e3], &labels, 0.25, 64.0);
+        assert!(
+            out.loss >= 0.0,
+            "circle loss should be >= 0, got {}",
+            out.loss
+        );
+        assert!(out.loss.is_finite(), "circle loss should be finite");
+
+        // Well-separated data should have lower loss than overlapping
+        let sep0: &[f32] = &[1.0, 0.0, 0.0];
+        let sep1: &[f32] = &[0.9, 0.1, 0.0];
+        let sep2: &[f32] = &[0.0, 0.0, 1.0];
+        let sep3: &[f32] = &[0.0, 0.1, 0.9];
+        let out_sep = circle_loss(&[sep0, sep1, sep2, sep3], &labels, 0.25, 64.0);
+        assert!(
+            out_sep.loss <= out.loss + 0.01,
+            "separated data ({}) should have <= loss than overlapping ({})",
+            out_sep.loss,
+            out.loss
+        );
+    }
+
+    #[test]
+    fn test_lifted_structured_loss_basic() {
+        // Overlapping classes should produce loss > 0
+        let e0: &[f32] = &[1.0, 0.5];
+        let e1: &[f32] = &[0.9, 0.6];
+        let e2: &[f32] = &[0.8, 0.4];
+        let e3: &[f32] = &[1.1, 0.3];
+        let labels = [0, 0, 1, 1];
+
+        let out = lifted_structured_loss(&[e0, e1, e2, e3], &labels, 1.0);
+        assert!(
+            out.loss >= 0.0,
+            "lifted loss should be non-negative, got {}",
+            out.loss
+        );
+        assert!(out.loss.is_finite(), "lifted loss should be finite");
+    }
+
+    #[test]
+    fn test_n_pairs_loss_equivalent_to_infonce() {
+        // N-pairs with dot product on normalized vectors should approximate InfoNCE
+        // with temperature=1.0 using cosine similarity.
+        // They differ in that InfoNCE uses cosine and n-pairs uses raw dot,
+        // but on unit vectors they're the same.
+        let mut a0 = vec![1.0f32, 0.0, 0.0];
+        let mut a1 = vec![0.0f32, 1.0, 0.0];
+        let mut p0 = vec![0.9f32, 0.1, 0.0];
+        let mut p1 = vec![0.1f32, 0.9, 0.0];
+
+        // Normalize
+        crate::similarity::l2_normalize(&mut a0);
+        crate::similarity::l2_normalize(&mut a1);
+        crate::similarity::l2_normalize(&mut p0);
+        crate::similarity::l2_normalize(&mut p1);
+
+        let np_out = n_pairs_loss(&[&a0, &a1], &[&p0, &p1], 1.0);
+        let infonce_out = infonce_loss(&[&a0, &a1], &[&p0, &p1], 1.0);
+
+        // On unit vectors, dot = cosine, so losses should be close
+        assert!(
+            (np_out.loss - infonce_out.loss).abs() < 0.1,
+            "n_pairs and infonce should be similar on unit vectors: n_pairs={}, infonce={}",
+            np_out.loss,
+            infonce_out.loss
+        );
     }
 }

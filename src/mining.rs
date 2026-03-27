@@ -87,6 +87,94 @@ impl NegativeMiner for RandomMiner {
     }
 }
 
+/// Selects informative pairs based on the multi-similarity criterion (Wang et al. 2019).
+///
+/// For each anchor, selects positive pairs where `sim(a, p) < max(sim(a, neg)) + epsilon`
+/// and negative pairs where `sim(a, n) > min(sim(a, pos)) - epsilon`.
+#[derive(Debug, Clone)]
+pub struct MultiSimilarityMiner {
+    /// Margin for pair selection.
+    pub epsilon: f32,
+}
+
+impl MultiSimilarityMiner {
+    /// Mine informative positive and negative indices for the given anchor.
+    ///
+    /// `positive_indices` and `negative_indices` partition `pool` into positives and negatives.
+    /// Returns `(informative_pos, informative_neg)` as index vectors into `pool`.
+    pub fn mine(
+        &self,
+        anchor: &[f32],
+        pool: &[&[f32]],
+        positive_indices: &[usize],
+        negative_indices: &[usize],
+    ) -> (Vec<usize>, Vec<usize>) {
+        if positive_indices.is_empty() || negative_indices.is_empty() {
+            return (vec![], vec![]);
+        }
+
+        // Compute similarities
+        let pos_sims: Vec<(usize, f32)> = positive_indices
+            .iter()
+            .map(|&i| (i, cosine_similarity(anchor, pool[i])))
+            .collect();
+        let neg_sims: Vec<(usize, f32)> = negative_indices
+            .iter()
+            .map(|&i| (i, cosine_similarity(anchor, pool[i])))
+            .collect();
+
+        let max_neg_sim = neg_sims
+            .iter()
+            .map(|&(_, s)| s)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_pos_sim = pos_sims
+            .iter()
+            .map(|&(_, s)| s)
+            .fold(f32::INFINITY, f32::min);
+
+        // Informative positives: harder than the hardest negative (with margin)
+        let informative_pos: Vec<usize> = pos_sims
+            .iter()
+            .filter(|&&(_, s)| s < max_neg_sim + self.epsilon)
+            .map(|&(i, _)| i)
+            .collect();
+
+        // Informative negatives: harder than the easiest positive (with margin)
+        let informative_neg: Vec<usize> = neg_sims
+            .iter()
+            .filter(|&&(_, s)| s > min_pos_sim - self.epsilon)
+            .map(|&(i, _)| i)
+            .collect();
+
+        (informative_pos, informative_neg)
+    }
+}
+
+/// Samples pairs with probability proportional to distance (Wu et al. 2017).
+///
+/// Filters pairs by distance thresholds to avoid degenerate sampling.
+#[derive(Debug, Clone)]
+pub struct DistanceWeightedMiner {
+    /// Minimum distance threshold -- pairs closer than this are excluded.
+    pub cutoff: f32,
+    /// Maximum distance -- pairs farther than this are excluded.
+    pub nonzero_loss_cutoff: f32,
+}
+
+impl NegativeMiner for DistanceWeightedMiner {
+    fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
+        (0..pool.len())
+            .filter(|i| {
+                if exclude.contains(i) {
+                    return false;
+                }
+                let d = 1.0 - cosine_similarity(anchor, pool[*i]);
+                d >= self.cutoff && d <= self.nonzero_loss_cutoff
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +270,66 @@ mod tests {
         for &idx in &result {
             assert!(idx < pool.len(), "index should be in range");
         }
+    }
+
+    #[test]
+    fn test_multi_similarity_miner_selects_informative() {
+        let anchor: &[f32] = &[1.0, 0.0];
+        let pool: Vec<&[f32]> = vec![
+            &[0.99, 0.14], // idx 0: positive, very similar (easy positive)
+            &[0.5, 0.87],  // idx 1: positive, less similar (informative positive)
+            &[0.0, 1.0],   // idx 2: negative, orthogonal (easy negative)
+            &[0.87, 0.5],  // idx 3: negative, fairly similar (informative negative)
+        ];
+        let pos_idx = vec![0, 1];
+        let neg_idx = vec![2, 3];
+
+        let miner = MultiSimilarityMiner { epsilon: 0.1 };
+        let (inf_pos, inf_neg) = miner.mine(anchor, &pool, &pos_idx, &neg_idx);
+
+        // Index 1 (less similar positive) should be selected as informative
+        assert!(
+            inf_pos.contains(&1),
+            "less similar positive should be informative, got {:?}",
+            inf_pos
+        );
+        // Index 3 (similar negative) should be selected as informative
+        assert!(
+            inf_neg.contains(&3),
+            "similar negative should be informative, got {:?}",
+            inf_neg
+        );
+    }
+
+    #[test]
+    fn test_distance_weighted_miner() {
+        let anchor: &[f32] = &[1.0, 0.0];
+        let pool: Vec<&[f32]> = vec![
+            &[0.99, 0.14], // very close, cos~0.99, d~0.01
+            &[0.5, 0.87],  // medium, cos~0.5, d~0.5
+            &[-1.0, 0.0],  // far, cos=-1, d=2.0
+        ];
+
+        let miner = DistanceWeightedMiner {
+            cutoff: 0.1,
+            nonzero_loss_cutoff: 1.5,
+        };
+        let result = miner.mine(anchor, &pool, &[]);
+
+        // Index 0 is too close (d < cutoff)
+        assert!(
+            !result.contains(&0),
+            "very close pair should be excluded by cutoff"
+        );
+        // Index 1 should be in range
+        assert!(
+            result.contains(&1),
+            "medium distance pair should be included"
+        );
+        // Index 2 is too far (d > nonzero_loss_cutoff)
+        assert!(
+            !result.contains(&2),
+            "very far pair should be excluded by nonzero_loss_cutoff"
+        );
     }
 }
