@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "contrastive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Contrastive learning losses and hard negative mining for embedding training"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arclabs561/contrastive"
+categories = ["science", "algorithms"]
+keywords = ["contrastive-learning", "triplet-loss", "metric-learning", "embedding", "infonce"]
+
+[dependencies]
+thiserror = "2.0"
+rand = { version = "0.9", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = ["mining"]
+mining = ["dep:rand"]
+serde = ["dep:serde"]
