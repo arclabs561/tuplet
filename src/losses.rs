@@ -582,10 +582,92 @@ pub fn multi_similarity_loss(
 
     total_loss /= n as f32;
 
-    // Gradients omitted -- loss values are correct, gradients for MS loss
-    // involve chain through cosine similarity for all pairwise terms.
-    // Returning empty gradients with a note.
-    let grad = vec![vec![0.0f32; dim]; n];
+    // Gradients via chain rule through cosine similarity.
+    // dL/d(S_ij) for anchor i:
+    //   positive j: -w_p(i,j) where w_p = exp(-alpha*(S-base)) / (1 + sum_p' exp(-alpha*(S-base)))
+    //   negative j:  w_n(i,j) where w_n = exp(beta*(S-base))  / (1 + sum_n' exp(beta*(S-base)))
+    // Then chain: dL/de_i += dL/dS_ij * dS_ij/de_i
+    //             dL/de_j += dL/dS_ij * dS_ij/de_j
+    // where dcos(a,b)/da_k = b_k/(|a|*|b|) - cos(a,b)*a_k/|a|^2
+
+    let mut grad = vec![vec![0.0f32; dim]; n];
+    let scale = 1.0 / n as f32;
+
+    // Precompute norms
+    let norms: Vec<f32> = embeddings.iter().map(|e| dot(e, e).sqrt()).collect();
+
+    for i in 0..n {
+        let pos: Vec<usize> = (0..n)
+            .filter(|&j| j != i && labels[j] == labels[i])
+            .collect();
+        let neg: Vec<usize> = (0..n).filter(|&j| labels[j] != labels[i]).collect();
+
+        if pos.is_empty() || neg.is_empty() {
+            continue;
+        }
+
+        // Compute softmax weights for positive term
+        let pos_exps: Vec<f32> = pos
+            .iter()
+            .map(|&p| (-alpha * (sims[i][p] - base)).exp())
+            .collect();
+        let pos_denom: f32 = 1.0 + pos_exps.iter().sum::<f32>();
+
+        // Compute softmax weights for negative term
+        let neg_exps: Vec<f32> = neg
+            .iter()
+            .map(|&n| (beta * (sims[i][n] - base)).exp())
+            .collect();
+        let neg_denom: f32 = 1.0 + neg_exps.iter().sum::<f32>();
+
+        let norm_i = norms[i];
+        if norm_i < 1e-8 {
+            continue;
+        }
+
+        // Positive pairs: dL/dS_ip = -w_p(i,p)
+        for (pi, &p) in pos.iter().enumerate() {
+            let w = pos_exps[pi] / pos_denom;
+            let norm_p = norms[p];
+            if norm_p < 1e-8 {
+                continue;
+            }
+            let cos_val = sims[i][p];
+            // dL/dS * scale
+            let dsim = -w * scale;
+
+            for d in 0..dim {
+                let dcos_di = embeddings[p][d] / (norm_i * norm_p)
+                    - embeddings[i][d] * cos_val / (norm_i * norm_i);
+                let dcos_dp = embeddings[i][d] / (norm_i * norm_p)
+                    - embeddings[p][d] * cos_val / (norm_p * norm_p);
+
+                grad[i][d] += dsim * dcos_di;
+                grad[p][d] += dsim * dcos_dp;
+            }
+        }
+
+        // Negative pairs: dL/dS_in = w_n(i,n)
+        for (ni, &nj) in neg.iter().enumerate() {
+            let w = neg_exps[ni] / neg_denom;
+            let norm_n = norms[nj];
+            if norm_n < 1e-8 {
+                continue;
+            }
+            let cos_val = sims[i][nj];
+            let dsim = w * scale;
+
+            for d in 0..dim {
+                let dcos_di = embeddings[nj][d] / (norm_i * norm_n)
+                    - embeddings[i][d] * cos_val / (norm_i * norm_i);
+                let dcos_dn = embeddings[i][d] / (norm_i * norm_n)
+                    - embeddings[nj][d] * cos_val / (norm_n * norm_n);
+
+                grad[i][d] += dsim * dcos_di;
+                grad[nj][d] += dsim * dcos_dn;
+            }
+        }
+    }
 
     LossOutput {
         loss: total_loss,
@@ -796,9 +878,134 @@ pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: 
 
     total_loss /= n as f32;
 
-    // Gradients omitted for circle loss -- the adaptive weighting makes the chain rule
-    // through alpha_p/alpha_n non-trivial. Loss values are correct.
-    let grad = vec![vec![0.0f32; dim]; n];
+    // Gradients with full alpha dependency (not detached).
+    // logit_n = gamma * alpha_n * (s_n - delta_n) where alpha_n = max(0, s_n - O_n)
+    // When alpha_n > 0: d(logit_n)/d(s_n) = gamma * (2*s_n - delta_n - O_n)
+    // When alpha_n = 0: d(logit_n)/d(s_n) = 0
+    //
+    // logit_p = -gamma * alpha_p * (s_p - delta_p) where alpha_p = max(0, O_p - s_p)
+    // When alpha_p > 0: d(logit_p)/d(s_p) = -gamma * (O_p - 2*s_p + delta_p)
+    // When alpha_p = 0: d(logit_p)/d(s_p) = 0
+    //
+    // dL/d(s) = sigmoid(combined) * softmax_weight * d(logit)/d(s)
+    // Then chain through d(cosine)/d(embedding).
+
+    let mut grad = vec![vec![0.0f32; dim]; n];
+    let scale = 1.0 / n as f32;
+
+    // Precompute norms
+    let norms: Vec<f32> = embeddings.iter().map(|e| dot(e, e).sqrt()).collect();
+
+    for i in 0..n {
+        let pos: Vec<usize> = (0..n)
+            .filter(|&j| j != i && labels[j] == labels[i])
+            .collect();
+        let neg: Vec<usize> = (0..n).filter(|&j| labels[j] != labels[i]).collect();
+
+        if pos.is_empty() || neg.is_empty() {
+            continue;
+        }
+
+        // Recompute logits for this anchor
+        let neg_logits: Vec<f32> = neg
+            .iter()
+            .map(|&j| {
+                let alpha_n = (sims[i][j] - o_n).max(0.0);
+                gamma * alpha_n * (sims[i][j] - delta_n)
+            })
+            .collect();
+
+        let pos_logits: Vec<f32> = pos
+            .iter()
+            .map(|&j| {
+                let alpha_p = (o_p - sims[i][j]).max(0.0);
+                -gamma * alpha_p * (sims[i][j] - delta_p)
+            })
+            .collect();
+
+        let max_neg = neg_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp_neg: f32 = neg_logits.iter().map(|&v| (v - max_neg).exp()).sum();
+        let lse_neg = max_neg + sum_exp_neg.ln();
+
+        let max_pos = pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp_pos: f32 = pos_logits.iter().map(|&v| (v - max_pos).exp()).sum();
+        let lse_pos = max_pos + sum_exp_pos.ln();
+
+        let combined = lse_neg + lse_pos;
+        // sigmoid(combined) = d softplus / d combined
+        let sigmoid_c = if combined > 20.0 {
+            1.0
+        } else if combined < -20.0 {
+            0.0
+        } else {
+            1.0 / (1.0 + (-combined).exp())
+        };
+
+        let norm_i = norms[i];
+        if norm_i < 1e-8 {
+            continue;
+        }
+
+        // Negative pairs
+        for (ni, &nj) in neg.iter().enumerate() {
+            let s_n = sims[i][nj];
+            let alpha_n = (s_n - o_n).max(0.0);
+            if alpha_n == 0.0 {
+                continue;
+            }
+            // Full derivative of logit_n w.r.t. s_n
+            let dlogit_ds = gamma * (2.0 * s_n - delta_n - o_n);
+            // softmax weight within negative logits
+            let w_n = (neg_logits[ni] - max_neg).exp() / sum_exp_neg;
+            // dL/ds_n = sigmoid_c * w_n * dlogit_ds
+            let dsim = sigmoid_c * w_n * dlogit_ds * scale;
+
+            let norm_n = norms[nj];
+            if norm_n < 1e-8 {
+                continue;
+            }
+
+            for d in 0..dim {
+                let dcos_di = embeddings[nj][d] / (norm_i * norm_n)
+                    - embeddings[i][d] * s_n / (norm_i * norm_i);
+                let dcos_dn = embeddings[i][d] / (norm_i * norm_n)
+                    - embeddings[nj][d] * s_n / (norm_n * norm_n);
+
+                grad[i][d] += dsim * dcos_di;
+                grad[nj][d] += dsim * dcos_dn;
+            }
+        }
+
+        // Positive pairs
+        for (pi, &pj) in pos.iter().enumerate() {
+            let s_p = sims[i][pj];
+            let alpha_p = (o_p - s_p).max(0.0);
+            if alpha_p == 0.0 {
+                continue;
+            }
+            // Full derivative of logit_p w.r.t. s_p
+            let dlogit_ds = -gamma * (o_p - 2.0 * s_p + delta_p);
+            // softmax weight within positive logits
+            let w_p = (pos_logits[pi] - max_pos).exp() / sum_exp_pos;
+            // dL/ds_p = sigmoid_c * w_p * dlogit_ds
+            let dsim = sigmoid_c * w_p * dlogit_ds * scale;
+
+            let norm_p = norms[pj];
+            if norm_p < 1e-8 {
+                continue;
+            }
+
+            for d in 0..dim {
+                let dcos_di = embeddings[pj][d] / (norm_i * norm_p)
+                    - embeddings[i][d] * s_p / (norm_i * norm_i);
+                let dcos_dp = embeddings[i][d] / (norm_i * norm_p)
+                    - embeddings[pj][d] * s_p / (norm_p * norm_p);
+
+                grad[i][d] += dsim * dcos_di;
+                grad[pj][d] += dsim * dcos_dp;
+            }
+        }
+    }
 
     LossOutput {
         loss: total_loss,
@@ -867,12 +1074,111 @@ pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f
     if count > 0 {
         total_loss /= count as f32;
     }
-    // Take square root of average squared hinge for numerical stability
-    // Actually the original paper uses 0.5 * max(0, ...)^2
+    // The original paper uses 0.5 * max(0, ...)^2
     total_loss *= 0.5;
 
-    // Gradients omitted -- lifted structured involves nested log-sum-exp over distances.
-    let grad = vec![vec![0.0f32; dim]; n];
+    // Gradients: L = (0.5/|P|) * sum_{(i,j) in P} max(0, J_ij)^2
+    // where J_ij = lse_i + lse_j + d_ij
+    // For active pairs (J_ij > 0):
+    //   dL/d(d_ik) = (J_ij / |P|) * (-softmax_weight_ik)  for negative k of i
+    //   dL/d(d_jl) = (J_ij / |P|) * (-softmax_weight_jl)  for negative l of j
+    //   dL/d(d_ij) = (J_ij / |P|) * 1
+    // Then chain: d||a-b||/da = (a-b)/||a-b||
+
+    let mut grad = vec![vec![0.0f32; dim]; n];
+
+    if count > 0 {
+        let count_f = count as f32;
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if labels[i] != labels[j] {
+                    continue;
+                }
+
+                let d_ij = dists[i][j];
+
+                // Negatives of i
+                let neg_i_indices: Vec<usize> =
+                    (0..n).filter(|&k| labels[k] != labels[i]).collect();
+                let neg_i_vals: Vec<f32> = neg_i_indices
+                    .iter()
+                    .map(|&k| margin - dists[i][k])
+                    .collect();
+
+                // Negatives of j
+                let neg_j_indices: Vec<usize> =
+                    (0..n).filter(|&l| labels[l] != labels[j]).collect();
+                let neg_j_vals: Vec<f32> = neg_j_indices
+                    .iter()
+                    .map(|&l| margin - dists[j][l])
+                    .collect();
+
+                if neg_i_vals.is_empty() || neg_j_vals.is_empty() {
+                    continue;
+                }
+
+                let lse_i = log_sum_exp(&neg_i_vals);
+                let lse_j = log_sum_exp(&neg_j_vals);
+
+                let j_ij = lse_i + lse_j + d_ij;
+                if j_ij <= 0.0 {
+                    continue;
+                }
+
+                // Coefficient: J_ij / |P| (from d/dx of 0.5 * x^2 = x, times 1/|P|)
+                let coeff = j_ij / count_f;
+
+                // Softmax weights for negatives of i
+                let max_ni = neg_i_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let ni_exps: Vec<f32> = neg_i_vals.iter().map(|&v| (v - max_ni).exp()).collect();
+                let ni_sum: f32 = ni_exps.iter().sum();
+
+                // Softmax weights for negatives of j
+                let max_nj = neg_j_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let nj_exps: Vec<f32> = neg_j_vals.iter().map(|&v| (v - max_nj).exp()).collect();
+                let nj_sum: f32 = nj_exps.iter().sum();
+
+                // Gradient from d_ij term: dL/d(d_ij) = coeff
+                let inv_d_ij = if d_ij > 1e-8 { 1.0 / d_ij } else { 0.0 };
+                for d in 0..dim {
+                    let diff = embeddings[i][d] - embeddings[j][d];
+                    let dd_di = diff * inv_d_ij;
+                    grad[i][d] += coeff * dd_di;
+                    grad[j][d] -= coeff * dd_di;
+                }
+
+                // Gradient from lse_i: d(lse_i)/d(d_ik) = -softmax_weight_ik
+                // so dL/d(d_ik) = coeff * (-w_ik)
+                for (ki, &k) in neg_i_indices.iter().enumerate() {
+                    let w = ni_exps[ki] / ni_sum;
+                    let d_ik = dists[i][k];
+                    let inv_d_ik = if d_ik > 1e-8 { 1.0 / d_ik } else { 0.0 };
+                    for d in 0..dim {
+                        let diff = embeddings[i][d] - embeddings[k][d];
+                        let dd_di = diff * inv_d_ik;
+                        // dL/de_i += coeff * (-w) * d(d_ik)/de_i
+                        grad[i][d] += coeff * (-w) * dd_di;
+                        // dL/de_k += coeff * (-w) * d(d_ik)/de_k = coeff * (-w) * (-dd_di)
+                        grad[k][d] -= coeff * (-w) * dd_di;
+                    }
+                }
+
+                // Gradient from lse_j: d(lse_j)/d(d_jl) = -softmax_weight_jl
+                for (li, &l) in neg_j_indices.iter().enumerate() {
+                    let w = nj_exps[li] / nj_sum;
+                    let d_jl = dists[j][l];
+                    let inv_d_jl = if d_jl > 1e-8 { 1.0 / d_jl } else { 0.0 };
+                    for d in 0..dim {
+                        let diff = embeddings[j][d] - embeddings[l][d];
+                        let dd_dj = diff * inv_d_jl;
+                        grad[j][d] += coeff * (-w) * dd_dj;
+                        grad[l][d] -= coeff * (-w) * dd_dj;
+                    }
+                }
+            }
+        }
+    }
 
     LossOutput {
         loss: total_loss,
@@ -1402,6 +1708,130 @@ mod tests {
             "n_pairs and infonce should be similar on unit vectors: n_pairs={}, infonce={}",
             np_out.loss,
             infonce_out.loss
+        );
+    }
+
+    /// Helper: numerical gradient check for batch-with-labels losses.
+    /// Perturbs each embedding dimension and compares analytical vs numerical gradient.
+    fn check_numerical_gradients_batch<F>(
+        embeddings: &[Vec<f32>],
+        loss_fn: F,
+        analytical_grads: &[Vec<f32>],
+        eps: f32,
+        tol: f32,
+        name: &str,
+    ) where
+        F: Fn(&[&[f32]]) -> f32,
+    {
+        let n = embeddings.len();
+        let dim = embeddings[0].len();
+
+        for i in 0..n {
+            for d in 0..dim {
+                let mut emb_plus: Vec<Vec<f32>> = embeddings.iter().map(|e| e.clone()).collect();
+                let mut emb_minus: Vec<Vec<f32>> = embeddings.iter().map(|e| e.clone()).collect();
+                emb_plus[i][d] += eps;
+                emb_minus[i][d] -= eps;
+
+                let refs_plus: Vec<&[f32]> = emb_plus.iter().map(|e| e.as_slice()).collect();
+                let refs_minus: Vec<&[f32]> = emb_minus.iter().map(|e| e.as_slice()).collect();
+
+                let loss_plus = loss_fn(&refs_plus);
+                let loss_minus = loss_fn(&refs_minus);
+                let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+                let analytical = analytical_grads[i][d];
+
+                let err = (analytical - numerical).abs();
+                let denom = numerical.abs().max(analytical.abs()).max(1e-6);
+                let rel_err = err / denom;
+
+                assert!(
+                    rel_err < tol || err < tol * 0.1,
+                    "{} grad[{i}][{d}]: analytical={analytical}, numerical={numerical}, \
+                     err={err}, rel_err={rel_err}",
+                    name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_similarity_gradient_numerical() {
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![0.7, 0.3, -0.2],
+            vec![0.5, 0.8, 0.1],
+            vec![-0.3, 0.1, 0.9],
+            vec![-0.5, 0.2, 0.7],
+        ];
+        let labels = [0, 0, 1, 1];
+        let alpha = 2.0;
+        let beta_val = 40.0;
+        let base = 0.5;
+
+        let refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
+        let out = multi_similarity_loss(&refs, &labels, alpha, beta_val, base);
+
+        check_numerical_gradients_batch(
+            &embeddings,
+            |embs| multi_similarity_loss(embs, &labels, alpha, beta_val, base).loss,
+            &out.grad_anchors,
+            1e-4,
+            1e-2,
+            "multi_similarity",
+        );
+    }
+
+    #[test]
+    fn test_circle_gradient_numerical() {
+        // Use moderate gamma to avoid numerical issues with large gradients
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![0.8, 0.2, -0.1],
+            vec![0.6, 0.7, 0.1],
+            vec![-0.4, 0.3, 0.8],
+            vec![-0.3, 0.1, 0.6],
+        ];
+        let labels = [0, 0, 1, 1];
+        let margin = 0.25;
+        let gamma = 16.0;
+
+        let refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
+        let out = circle_loss(&refs, &labels, margin, gamma);
+
+        check_numerical_gradients_batch(
+            &embeddings,
+            |embs| circle_loss(embs, &labels, margin, gamma).loss,
+            &out.grad_anchors,
+            1e-4,
+            5e-2,
+            "circle",
+        );
+    }
+
+    #[test]
+    fn test_lifted_structured_gradient_numerical() {
+        // Use embeddings where classes overlap so loss > 0 and gradients are active
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.5, 0.2],
+            vec![0.9, 0.6, 0.3],
+            vec![0.8, 0.4, 0.1],
+            vec![0.7, 0.7, 0.2],
+        ];
+        let labels = [0, 0, 1, 1];
+        let margin = 1.0;
+
+        let refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
+        let out = lifted_structured_loss(&refs, &labels, margin);
+
+        // Verify loss is active (non-zero)
+        assert!(out.loss > 0.0, "need active loss for gradient check");
+
+        check_numerical_gradients_batch(
+            &embeddings,
+            |embs| lifted_structured_loss(embs, &labels, margin).loss,
+            &out.grad_anchors,
+            1e-4,
+            5e-2,
+            "lifted_structured",
         );
     }
 }
