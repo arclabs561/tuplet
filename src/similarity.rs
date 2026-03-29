@@ -10,7 +10,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_a = dot(a, a).sqrt();
     let norm_b = dot(b, b).sqrt();
     let denom = norm_a * norm_b;
-    if denom == 0.0 { 0.0 } else { d / denom }
+    if denom == 0.0 {
+        0.0
+    } else {
+        d / denom
+    }
 }
 
 /// Euclidean distance between two vectors.
@@ -38,6 +42,72 @@ pub fn pairwise_cosine(batch: &[&[f32]]) -> Vec<Vec<f32>> {
         }
     }
     result
+}
+
+/// Cosine similarity with norms returned for gradient computation.
+///
+/// Returns `(cosine_similarity, norm_a, norm_b)`.
+pub(crate) fn cosine_similarity_with_norms(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    let d = dot(a, b);
+    let norm_a = dot(a, a).sqrt();
+    let norm_b = dot(b, b).sqrt();
+    let denom = norm_a * norm_b;
+    let cos = if denom == 0.0 { 0.0 } else { d / denom };
+    (cos, norm_a, norm_b)
+}
+
+/// Accumulate cosine similarity gradients into `grad_a` and `grad_b`.
+///
+/// Given `cos(a, b) = dot(a, b) / (|a| * |b|)`, accumulates:
+///   `grad_a[d] += scale * d(cos)/d(a[d])`
+///   `grad_b[d] += scale * d(cos)/d(b[d])`
+///
+/// Caller must ensure `norm_a > 0` and `norm_b > 0`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accumulate_cosine_grad(
+    a: &[f32],
+    b: &[f32],
+    cos_val: f32,
+    norm_a: f32,
+    norm_b: f32,
+    scale: f32,
+    grad_a: &mut [f32],
+    grad_b: &mut [f32],
+) {
+    let inv_na_nb = 1.0 / (norm_a * norm_b);
+    let cos_over_na2 = cos_val / (norm_a * norm_a);
+    let cos_over_nb2 = cos_val / (norm_b * norm_b);
+    for d in 0..a.len() {
+        grad_a[d] += scale * (b[d] * inv_na_nb - a[d] * cos_over_na2);
+        grad_b[d] += scale * (a[d] * inv_na_nb - b[d] * cos_over_nb2);
+    }
+}
+
+/// Accumulate cosine similarity gradients into two rows of the same gradient matrix.
+///
+/// Like [`accumulate_cosine_grad`] but handles the borrow-splitting required when
+/// `grad_a` and `grad_b` are different rows of the same `Vec<Vec<f32>>`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accumulate_cosine_grad_pair(
+    a: &[f32],
+    b: &[f32],
+    cos_val: f32,
+    norm_a: f32,
+    norm_b: f32,
+    scale: f32,
+    grad: &mut [Vec<f32>],
+    idx_a: usize,
+    idx_b: usize,
+) {
+    let inv_na_nb = 1.0 / (norm_a * norm_b);
+    let cos_over_na2 = cos_val / (norm_a * norm_a);
+    let cos_over_nb2 = cos_val / (norm_b * norm_b);
+    for d in 0..a.len() {
+        let dcos_da = b[d] * inv_na_nb - a[d] * cos_over_na2;
+        let dcos_db = a[d] * inv_na_nb - b[d] * cos_over_nb2;
+        grad[idx_a][d] += scale * dcos_da;
+        grad[idx_b][d] += scale * dcos_db;
+    }
 }
 
 /// L2 normalize a vector in-place. Returns the original norm.

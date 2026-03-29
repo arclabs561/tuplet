@@ -1,18 +1,13 @@
 use crate::similarity::cosine_similarity;
 use rand::seq::SliceRandom;
 
-/// Selects negative indices from a candidate pool.
-pub trait NegativeMiner {
-    /// Returns indices into `pool` of selected negatives, excluding indices in `exclude`.
-    fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize>;
-}
-
 /// Uses all non-excluded items in the pool as negatives.
 #[derive(Debug, Clone)]
 pub struct InBatchMiner;
 
-impl NegativeMiner for InBatchMiner {
-    fn mine(&self, _anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
+impl InBatchMiner {
+    /// Returns indices of all non-excluded items in the pool.
+    pub fn mine(&self, _anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
         (0..pool.len()).filter(|i| !exclude.contains(i)).collect()
     }
 }
@@ -21,8 +16,9 @@ impl NegativeMiner for InBatchMiner {
 #[derive(Debug, Clone)]
 pub struct HardestMiner;
 
-impl NegativeMiner for HardestMiner {
-    fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
+impl HardestMiner {
+    /// Returns the index of the most similar non-excluded candidate.
+    pub fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
         let mut best_idx = None;
         let mut best_sim = f32::NEG_INFINITY;
 
@@ -49,14 +45,20 @@ impl NegativeMiner for HardestMiner {
 pub struct SemiHardMiner {
     /// Width of the margin band.
     pub margin: f32,
-    /// Precomputed `d(anchor, positive)` as cosine distance (`1 - cos`).
-    pub positive_distance: f32,
 }
 
-impl NegativeMiner for SemiHardMiner {
-    fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
-        let d_ap = self.positive_distance;
-        let upper = d_ap + self.margin;
+impl SemiHardMiner {
+    /// Mine semi-hard negatives.
+    ///
+    /// `positive_distance` is the cosine distance (`1 - cos`) from anchor to its positive.
+    pub fn mine(
+        &self,
+        anchor: &[f32],
+        pool: &[&[f32]],
+        exclude: &[usize],
+        positive_distance: f32,
+    ) -> Vec<usize> {
+        let upper = positive_distance + self.margin;
 
         (0..pool.len())
             .filter(|i| {
@@ -64,7 +66,7 @@ impl NegativeMiner for SemiHardMiner {
                     return false;
                 }
                 let d_an = 1.0 - cosine_similarity(anchor, pool[*i]);
-                d_an > d_ap && d_an < upper
+                d_an > positive_distance && d_an < upper
             })
             .collect()
     }
@@ -77,8 +79,9 @@ pub struct RandomMiner {
     pub k: usize,
 }
 
-impl NegativeMiner for RandomMiner {
-    fn mine(&self, _anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
+impl RandomMiner {
+    /// Returns up to `k` random non-excluded indices.
+    pub fn mine(&self, _anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
         let mut candidates: Vec<usize> = (0..pool.len()).filter(|i| !exclude.contains(i)).collect();
         let mut rng = rand::rng();
         candidates.shuffle(&mut rng);
@@ -161,8 +164,9 @@ pub struct DistanceWeightedMiner {
     pub nonzero_loss_cutoff: f32,
 }
 
-impl NegativeMiner for DistanceWeightedMiner {
-    fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
+impl DistanceWeightedMiner {
+    /// Returns indices of candidates within the distance band `[cutoff, nonzero_loss_cutoff]`.
+    pub fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
         (0..pool.len())
             .filter(|i| {
                 if exclude.contains(i) {
@@ -225,11 +229,8 @@ mod tests {
         ];
         let exclude = vec![];
 
-        let miner = SemiHardMiner {
-            margin: 0.3,
-            positive_distance: 0.1,
-        };
-        let result = miner.mine(anchor, &pool, &exclude);
+        let miner = SemiHardMiner { margin: 0.3 };
+        let result = miner.mine(anchor, &pool, &exclude, 0.1);
 
         // Only index 1 should be in the band
         assert!(

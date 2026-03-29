@@ -9,10 +9,15 @@ description = "Metric learning from Mahalanobis to InfoNCE: distance learning, c
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arclabs561/mahala"
 categories = ["science", "algorithms"]
-keywords = ["mahalanobis", "metric-learning", "contrastive-learning", "triplet-loss", "infonce"]
+keywords = [
+  "mahalanobis",
+  "metric-learning",
+  "contrastive-learning",
+  "triplet-loss",
+  "infonce",
+]
 
 [dependencies]
-thiserror = "2.0"
 rand = { version = "0.9", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 

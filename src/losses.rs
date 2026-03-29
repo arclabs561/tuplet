@@ -1,16 +1,29 @@
-use crate::similarity::{cosine_similarity, dot, euclidean_distance};
+use crate::similarity::{
+    accumulate_cosine_grad, accumulate_cosine_grad_pair, cosine_similarity,
+    cosine_similarity_with_norms, dot, euclidean_distance,
+};
 
 /// Result of a loss computation.
+///
+/// Two usage patterns:
+/// - **Pair losses** (triplet, infonce, mnrl, n-pairs, contrastive, cosine embedding):
+///   `grad_anchors` and `grad_positives` hold per-input gradients.
+///   `grad_negatives` is populated only when explicit negatives are provided (triplet, mnrl).
+/// - **Batch losses** (multi-similarity, supcon, circle, lifted-structured):
+///   `grad_anchors` holds gradients for ALL embeddings in the batch.
+///   `grad_positives` and `grad_negatives` are empty.
+///
+/// All losses use mean reduction (loss and gradients are divided by batch size).
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct LossOutput {
-    /// Scalar loss value.
+    /// Scalar loss value (mean-reduced).
     pub loss: f32,
-    /// Gradients w.r.t. anchor embeddings. Shape: `[batch_size][dim]`.
+    /// Gradients w.r.t. anchor embeddings, or all embeddings for batch losses.
     pub grad_anchors: Vec<Vec<f32>>,
-    /// Gradients w.r.t. positive embeddings. Shape: `[batch_size][dim]`.
+    /// Gradients w.r.t. positive embeddings. Empty for batch losses.
     pub grad_positives: Vec<Vec<f32>>,
-    /// Gradients w.r.t. negative embeddings. Shape: `[n_negatives][dim]`.
-    /// Empty for in-batch negative losses.
+    /// Gradients w.r.t. negative embeddings. Empty unless explicit negatives are provided.
     pub grad_negatives: Vec<Vec<f32>>,
 }
 
@@ -86,34 +99,34 @@ pub fn triplet_loss_with_distance(
                     }
                 }
                 DistanceFn::Cosine => {
-                    // d(cosine_distance)/d(a) = -d(cosine_similarity)/d(a)
-                    // cosine_sim = dot(a,b) / (|a| * |b|)
-                    let norm_a = dot(anchors[i], anchors[i]).sqrt();
-                    let norm_p = dot(positives[i], positives[i]).sqrt();
-                    let norm_n = dot(negatives[i], negatives[i]).sqrt();
+                    // loss = (1 - cos_ap) - (1 - cos_an) + margin = cos_an - cos_ap + margin
+                    // dL/d(cos_ap) = -1, dL/d(cos_an) = +1
+                    let (cos_ap, na, np) = cosine_similarity_with_norms(anchors[i], positives[i]);
+                    let (cos_an, na2, nn) = cosine_similarity_with_norms(anchors[i], negatives[i]);
+                    let _ = (cos_ap, cos_an); // used for forward pass above
 
-                    if norm_a > 1e-8 && norm_p > 1e-8 && norm_n > 1e-8 {
-                        let cos_ap = dot(anchors[i], positives[i]) / (norm_a * norm_p);
-                        let cos_an = dot(anchors[i], negatives[i]) / (norm_a * norm_n);
-
-                        for d in 0..dim {
-                            // d(cos_sim(a,p))/d(a_d) = p_d/(|a|*|p|) - a_d*cos_ap/|a|^2
-                            let dcos_ap_da = positives[i][d] / (norm_a * norm_p)
-                                - anchors[i][d] * cos_ap / (norm_a * norm_a);
-                            let dcos_ap_dp = anchors[i][d] / (norm_a * norm_p)
-                                - positives[i][d] * cos_ap / (norm_p * norm_p);
-
-                            let dcos_an_da = negatives[i][d] / (norm_a * norm_n)
-                                - anchors[i][d] * cos_an / (norm_a * norm_a);
-                            let dcos_an_dn = anchors[i][d] / (norm_a * norm_n)
-                                - negatives[i][d] * cos_an / (norm_n * norm_n);
-
-                            // loss = (1 - cos_ap) - (1 - cos_an) + margin = cos_an - cos_ap + margin
-                            // dL/da = -dcos_ap/da + dcos_an/da
-                            grad_a[i][d] += -dcos_ap_da + dcos_an_da;
-                            grad_p[i][d] += -dcos_ap_dp;
-                            grad_n[i][d] += dcos_an_dn;
-                        }
+                    if na > 1e-8 && np > 1e-8 && nn > 1e-8 {
+                        // -dcos_ap/da + dcos_an/da, -dcos_ap/dp, +dcos_an/dn
+                        accumulate_cosine_grad(
+                            anchors[i],
+                            positives[i],
+                            cos_ap,
+                            na,
+                            np,
+                            -1.0,
+                            &mut grad_a[i],
+                            &mut grad_p[i],
+                        );
+                        accumulate_cosine_grad(
+                            anchors[i],
+                            negatives[i],
+                            cos_an,
+                            na2,
+                            nn,
+                            1.0,
+                            &mut grad_a[i],
+                            &mut grad_n[i],
+                        );
                     }
                 }
             }
@@ -182,33 +195,31 @@ pub fn infonce_loss(anchors: &[&[f32]], positives: &[&[f32]], temperature: f32) 
     let mut grad_a = vec![vec![0.0f32; dim]; batch];
     let mut grad_p = vec![vec![0.0f32; dim]; batch];
 
+    // Precompute norms
+    let norms_a: Vec<f32> = anchors.iter().map(|a| dot(a, a).sqrt()).collect();
+    let norms_p: Vec<f32> = positives.iter().map(|p| dot(p, p).sqrt()).collect();
+
     for i in 0..batch {
-        let norm_a = dot(anchors[i], anchors[i]).sqrt();
-        if norm_a < 1e-8 {
+        if norms_a[i] < 1e-8 {
             continue;
         }
-
         for j in 0..batch {
-            let norm_p = dot(positives[j], positives[j]).sqrt();
-            if norm_p < 1e-8 {
+            if norms_p[j] < 1e-8 {
                 continue;
             }
-
-            // dL/d(sim_ij) = (softmax_ij - delta_ij) / (batch * temperature)
             let delta = if i == j { 1.0 } else { 0.0 };
             let dsim = (softmax[i][j] - delta) / (batch as f32 * temperature);
-
-            let cos_val = dot(anchors[i], positives[j]) / (norm_a * norm_p);
-
-            for d in 0..dim {
-                let dcos_da = positives[j][d] / (norm_a * norm_p)
-                    - anchors[i][d] * cos_val / (norm_a * norm_a);
-                let dcos_dp = anchors[i][d] / (norm_a * norm_p)
-                    - positives[j][d] * cos_val / (norm_p * norm_p);
-
-                grad_a[i][d] += dsim * dcos_da;
-                grad_p[j][d] += dsim * dcos_dp;
-            }
+            let cos_val = sims[i][j] * temperature; // sims already divided by temperature
+            accumulate_cosine_grad(
+                anchors[i],
+                positives[j],
+                cos_val,
+                norms_a[i],
+                norms_p[j],
+                dsim,
+                &mut grad_a[i],
+                &mut grad_p[j],
+            );
         }
     }
 
@@ -273,53 +284,53 @@ pub fn mnrl_loss(
     let mut grad_p = vec![vec![0.0f32; dim]; batch];
     let mut grad_n = vec![vec![0.0f32; dim]; n_neg];
 
+    // Precompute norms
+    let norms_a: Vec<f32> = anchors.iter().map(|a| dot(a, a).sqrt()).collect();
+    let norms_p: Vec<f32> = positives.iter().map(|p| dot(p, p).sqrt()).collect();
+    let norms_n: Vec<f32> = negatives.iter().map(|n| dot(n, n).sqrt()).collect();
+
     for i in 0..batch {
-        let norm_a = dot(anchors[i], anchors[i]).sqrt();
-        if norm_a < 1e-8 {
+        if norms_a[i] < 1e-8 {
             continue;
         }
 
         // Gradients through positive candidates
         for j in 0..batch {
-            let norm_p = dot(positives[j], positives[j]).sqrt();
-            if norm_p < 1e-8 {
+            if norms_p[j] < 1e-8 {
                 continue;
             }
-
             let delta = if i == j { 1.0 } else { 0.0 };
             let dsim = (softmax[i][j] - delta) / (batch as f32 * temperature);
-            let cos_val = dot(anchors[i], positives[j]) / (norm_a * norm_p);
-
-            for d in 0..dim {
-                let dcos_da = positives[j][d] / (norm_a * norm_p)
-                    - anchors[i][d] * cos_val / (norm_a * norm_a);
-                let dcos_dp = anchors[i][d] / (norm_a * norm_p)
-                    - positives[j][d] * cos_val / (norm_p * norm_p);
-
-                grad_a[i][d] += dsim * dcos_da;
-                grad_p[j][d] += dsim * dcos_dp;
-            }
+            let cos_val = sims[i][j] * temperature;
+            accumulate_cosine_grad(
+                anchors[i],
+                positives[j],
+                cos_val,
+                norms_a[i],
+                norms_p[j],
+                dsim,
+                &mut grad_a[i],
+                &mut grad_p[j],
+            );
         }
 
         // Gradients through explicit negatives
         for k in 0..n_neg {
-            let norm_n = dot(negatives[k], negatives[k]).sqrt();
-            if norm_n < 1e-8 {
+            if norms_n[k] < 1e-8 {
                 continue;
             }
-
             let dsim = softmax[i][batch + k] / (batch as f32 * temperature);
-            let cos_val = dot(anchors[i], negatives[k]) / (norm_a * norm_n);
-
-            for d in 0..dim {
-                let dcos_da = negatives[k][d] / (norm_a * norm_n)
-                    - anchors[i][d] * cos_val / (norm_a * norm_a);
-                let dcos_dn = anchors[i][d] / (norm_a * norm_n)
-                    - negatives[k][d] * cos_val / (norm_n * norm_n);
-
-                grad_a[i][d] += dsim * dcos_da;
-                grad_n[k][d] += dsim * dcos_dn;
-            }
+            let cos_val = sims[i][batch + k] * temperature;
+            accumulate_cosine_grad(
+                anchors[i],
+                negatives[k],
+                cos_val,
+                norms_a[i],
+                norms_n[k],
+                dsim,
+                &mut grad_a[i],
+                &mut grad_n[k],
+            );
         }
     }
 
@@ -351,36 +362,38 @@ pub fn cosine_embedding_loss(
 
     for i in 0..n {
         let (a, b) = pairs[i];
-        let cos = cosine_similarity(a, b);
-
-        let norm_a = dot(a, a).sqrt();
-        let norm_b = dot(b, b).sqrt();
+        let (cos, norm_a, norm_b) = cosine_similarity_with_norms(a, b);
 
         if labels[i] {
-            // Positive: loss = 1 - cos
+            // Positive: loss = 1 - cos, dL/d(cos) = -1
             total_loss += 1.0 - cos;
-
             if norm_a > 1e-8 && norm_b > 1e-8 {
-                for d in 0..dim {
-                    // dL/da = -d(cos)/da
-                    let dcos_da = b[d] / (norm_a * norm_b) - a[d] * cos / (norm_a * norm_a);
-                    let dcos_db = a[d] / (norm_a * norm_b) - b[d] * cos / (norm_b * norm_b);
-                    grad_a[i][d] = -dcos_da;
-                    grad_p[i][d] = -dcos_db;
-                }
+                accumulate_cosine_grad(
+                    a,
+                    b,
+                    cos,
+                    norm_a,
+                    norm_b,
+                    -1.0,
+                    &mut grad_a[i],
+                    &mut grad_p[i],
+                );
             }
         } else {
-            // Negative: loss = max(0, cos - margin)
+            // Negative: loss = max(0, cos - margin), dL/d(cos) = 1 when active
             let loss_i = (cos - margin).max(0.0);
             total_loss += loss_i;
-
             if loss_i > 0.0 && norm_a > 1e-8 && norm_b > 1e-8 {
-                for d in 0..dim {
-                    let dcos_da = b[d] / (norm_a * norm_b) - a[d] * cos / (norm_a * norm_a);
-                    let dcos_db = a[d] / (norm_a * norm_b) - b[d] * cos / (norm_b * norm_b);
-                    grad_a[i][d] = dcos_da;
-                    grad_p[i][d] = dcos_db;
-                }
+                accumulate_cosine_grad(
+                    a,
+                    b,
+                    cos,
+                    norm_a,
+                    norm_b,
+                    1.0,
+                    &mut grad_a[i],
+                    &mut grad_p[i],
+                );
             }
         }
     }
@@ -628,44 +641,41 @@ pub fn multi_similarity_loss(
         // Positive pairs: dL/dS_ip = -w_p(i,p)
         for (pi, &p) in pos.iter().enumerate() {
             let w = pos_exps[pi] / pos_denom;
-            let norm_p = norms[p];
-            if norm_p < 1e-8 {
+            if norms[p] < 1e-8 {
                 continue;
             }
-            let cos_val = sims[i][p];
-            // dL/dS * scale
             let dsim = -w * scale;
-
-            for d in 0..dim {
-                let dcos_di = embeddings[p][d] / (norm_i * norm_p)
-                    - embeddings[i][d] * cos_val / (norm_i * norm_i);
-                let dcos_dp = embeddings[i][d] / (norm_i * norm_p)
-                    - embeddings[p][d] * cos_val / (norm_p * norm_p);
-
-                grad[i][d] += dsim * dcos_di;
-                grad[p][d] += dsim * dcos_dp;
-            }
+            accumulate_cosine_grad_pair(
+                embeddings[i],
+                embeddings[p],
+                sims[i][p],
+                norm_i,
+                norms[p],
+                dsim,
+                &mut grad,
+                i,
+                p,
+            );
         }
 
         // Negative pairs: dL/dS_in = w_n(i,n)
         for (ni, &nj) in neg.iter().enumerate() {
             let w = neg_exps[ni] / neg_denom;
-            let norm_n = norms[nj];
-            if norm_n < 1e-8 {
+            if norms[nj] < 1e-8 {
                 continue;
             }
-            let cos_val = sims[i][nj];
             let dsim = w * scale;
-
-            for d in 0..dim {
-                let dcos_di = embeddings[nj][d] / (norm_i * norm_n)
-                    - embeddings[i][d] * cos_val / (norm_i * norm_i);
-                let dcos_dn = embeddings[i][d] / (norm_i * norm_n)
-                    - embeddings[nj][d] * cos_val / (norm_n * norm_n);
-
-                grad[i][d] += dsim * dcos_di;
-                grad[nj][d] += dsim * dcos_dn;
-            }
+            accumulate_cosine_grad_pair(
+                embeddings[i],
+                embeddings[nj],
+                sims[i][nj],
+                norm_i,
+                norms[nj],
+                dsim,
+                &mut grad,
+                i,
+                nj,
+            );
         }
     }
 
@@ -755,30 +765,25 @@ pub fn supcon_loss(embeddings: &[&[f32]], labels: &[usize], temperature: f32) ->
                 continue;
             }
 
-            // How much this pair contributes to the gradient of sim(i,j)
             let is_pos = labels[j] == labels[i];
             let dsim = if is_pos {
-                // -1/|P| * (1 - softmax_ij) + (|P|-1)/|P| * softmax_ij ... simplified:
-                // For positive p: dL/d(sim_ip) = -1/|P| + softmax_ip
-                // Actually: each positive p contributes -1/|P| to the numerator term
-                // and all positives share the same denominator, so:
-                // dL/d(sim_ij) = (-1/|P| + softmax_ij) when j is positive
-                (-1.0 / n_pos + softmax[j]) / (temperature)
+                (-1.0 / n_pos + softmax[j]) / temperature
             } else {
-                // For non-positive j: dL/d(sim_ij) = softmax_ij (from denominator)
                 softmax[j] / temperature
             };
 
             let cos_val = cosine_similarity(embeddings[i], embeddings[j]);
-            for d in 0..dim {
-                let dcos_di = embeddings[j][d] / (norm_i * norm_j)
-                    - embeddings[i][d] * cos_val / (norm_i * norm_i);
-                let dcos_dj = embeddings[i][d] / (norm_i * norm_j)
-                    - embeddings[j][d] * cos_val / (norm_j * norm_j);
-
-                grad[i][d] += dsim * dcos_di;
-                grad[j][d] += dsim * dcos_dj;
-            }
+            accumulate_cosine_grad_pair(
+                embeddings[i],
+                embeddings[j],
+                cos_val,
+                norm_i,
+                norm_j,
+                dsim,
+                &mut grad,
+                i,
+                j,
+            );
         }
     }
 
@@ -953,27 +958,24 @@ pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: 
             if alpha_n == 0.0 {
                 continue;
             }
-            // Full derivative of logit_n w.r.t. s_n
             let dlogit_ds = gamma * (2.0 * s_n - delta_n - o_n);
-            // softmax weight within negative logits
             let w_n = (neg_logits[ni] - max_neg).exp() / sum_exp_neg;
-            // dL/ds_n = sigmoid_c * w_n * dlogit_ds
             let dsim = sigmoid_c * w_n * dlogit_ds * scale;
 
-            let norm_n = norms[nj];
-            if norm_n < 1e-8 {
+            if norms[nj] < 1e-8 {
                 continue;
             }
-
-            for d in 0..dim {
-                let dcos_di = embeddings[nj][d] / (norm_i * norm_n)
-                    - embeddings[i][d] * s_n / (norm_i * norm_i);
-                let dcos_dn = embeddings[i][d] / (norm_i * norm_n)
-                    - embeddings[nj][d] * s_n / (norm_n * norm_n);
-
-                grad[i][d] += dsim * dcos_di;
-                grad[nj][d] += dsim * dcos_dn;
-            }
+            accumulate_cosine_grad_pair(
+                embeddings[i],
+                embeddings[nj],
+                s_n,
+                norm_i,
+                norms[nj],
+                dsim,
+                &mut grad,
+                i,
+                nj,
+            );
         }
 
         // Positive pairs
@@ -983,27 +985,24 @@ pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: 
             if alpha_p == 0.0 {
                 continue;
             }
-            // Full derivative of logit_p w.r.t. s_p
             let dlogit_ds = -gamma * (o_p - 2.0 * s_p + delta_p);
-            // softmax weight within positive logits
             let w_p = (pos_logits[pi] - max_pos).exp() / sum_exp_pos;
-            // dL/ds_p = sigmoid_c * w_p * dlogit_ds
             let dsim = sigmoid_c * w_p * dlogit_ds * scale;
 
-            let norm_p = norms[pj];
-            if norm_p < 1e-8 {
+            if norms[pj] < 1e-8 {
                 continue;
             }
-
-            for d in 0..dim {
-                let dcos_di = embeddings[pj][d] / (norm_i * norm_p)
-                    - embeddings[i][d] * s_p / (norm_i * norm_i);
-                let dcos_dp = embeddings[i][d] / (norm_i * norm_p)
-                    - embeddings[pj][d] * s_p / (norm_p * norm_p);
-
-                grad[i][d] += dsim * dcos_di;
-                grad[pj][d] += dsim * dcos_dp;
-            }
+            accumulate_cosine_grad_pair(
+                embeddings[i],
+                embeddings[pj],
+                s_p,
+                norm_i,
+                norms[pj],
+                dsim,
+                &mut grad,
+                i,
+                pj,
+            );
         }
     }
 
@@ -1728,8 +1727,8 @@ mod tests {
 
         for i in 0..n {
             for d in 0..dim {
-                let mut emb_plus: Vec<Vec<f32>> = embeddings.iter().map(|e| e.clone()).collect();
-                let mut emb_minus: Vec<Vec<f32>> = embeddings.iter().map(|e| e.clone()).collect();
+                let mut emb_plus: Vec<Vec<f32>> = embeddings.to_vec();
+                let mut emb_minus: Vec<Vec<f32>> = embeddings.to_vec();
                 emb_plus[i][d] += eps;
                 emb_minus[i][d] -= eps;
 
@@ -1809,7 +1808,6 @@ mod tests {
 
     #[test]
     fn test_lifted_structured_gradient_numerical() {
-        // Use embeddings where classes overlap so loss > 0 and gradients are active
         let embeddings: Vec<Vec<f32>> = vec![
             vec![1.0, 0.5, 0.2],
             vec![0.9, 0.6, 0.3],
@@ -1822,7 +1820,6 @@ mod tests {
         let refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
         let out = lifted_structured_loss(&refs, &labels, margin);
 
-        // Verify loss is active (non-zero)
         assert!(out.loss > 0.0, "need active loss for gradient check");
 
         check_numerical_gradients_batch(
@@ -1833,5 +1830,339 @@ mod tests {
             5e-2,
             "lifted_structured",
         );
+    }
+
+    /// Helper: numerical gradient check for pair-based losses (anchor/positive/negative).
+    #[allow(clippy::too_many_arguments)]
+    fn check_numerical_gradients_pair(
+        anchors: &[Vec<f32>],
+        positives: &[Vec<f32>],
+        negatives: &[Vec<f32>],
+        loss_fn: impl Fn(&[&[f32]], &[&[f32]], &[&[f32]]) -> f32,
+        grad_a: &[Vec<f32>],
+        grad_p: &[Vec<f32>],
+        grad_n: &[Vec<f32>],
+        eps: f32,
+        tol: f32,
+        name: &str,
+    ) {
+        let check = |vecs: &[Vec<f32>], grads: &[Vec<f32>], which: &str, perturb_which: usize| {
+            for i in 0..vecs.len() {
+                for d in 0..vecs[i].len() {
+                    let mut a_work: Vec<Vec<f32>> = anchors.to_vec();
+                    let mut p_work: Vec<Vec<f32>> = positives.to_vec();
+                    let mut n_work: Vec<Vec<f32>> = negatives.to_vec();
+                    let target = match perturb_which {
+                        0 => &mut a_work,
+                        1 => &mut p_work,
+                        _ => &mut n_work,
+                    };
+                    target[i][d] += eps;
+                    let a_refs: Vec<&[f32]> = a_work.iter().map(|v| v.as_slice()).collect();
+                    let p_refs: Vec<&[f32]> = p_work.iter().map(|v| v.as_slice()).collect();
+                    let n_refs: Vec<&[f32]> = n_work.iter().map(|v| v.as_slice()).collect();
+                    let loss_plus = loss_fn(&a_refs, &p_refs, &n_refs);
+
+                    let target = match perturb_which {
+                        0 => &mut a_work,
+                        1 => &mut p_work,
+                        _ => &mut n_work,
+                    };
+                    target[i][d] -= 2.0 * eps;
+                    let a_refs: Vec<&[f32]> = a_work.iter().map(|v| v.as_slice()).collect();
+                    let p_refs: Vec<&[f32]> = p_work.iter().map(|v| v.as_slice()).collect();
+                    let n_refs: Vec<&[f32]> = n_work.iter().map(|v| v.as_slice()).collect();
+                    let loss_minus = loss_fn(&a_refs, &p_refs, &n_refs);
+
+                    let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+                    let analytical = grads[i][d];
+                    let err = (analytical - numerical).abs();
+                    let denom = numerical.abs().max(analytical.abs()).max(1e-6);
+                    let rel_err = err / denom;
+
+                    assert!(
+                        rel_err < tol || err < tol * 0.1,
+                        "{name} {which}[{i}][{d}]: analytical={analytical}, numerical={numerical}, \
+                         err={err}, rel_err={rel_err}",
+                    );
+                }
+            }
+        };
+        check(anchors, grad_a, "anchor", 0);
+        check(positives, grad_p, "positive", 1);
+        if !negatives.is_empty() && !grad_n.is_empty() {
+            check(negatives, grad_n, "negative", 2);
+        }
+    }
+
+    #[test]
+    fn test_infonce_gradient_numerical() {
+        let anchors: Vec<Vec<f32>> = vec![vec![0.7, 0.3, -0.2], vec![-0.3, 0.8, 0.1]];
+        let positives: Vec<Vec<f32>> = vec![vec![0.5, 0.4, -0.1], vec![-0.2, 0.7, 0.3]];
+        let temperature = 0.1;
+
+        let a_refs: Vec<&[f32]> = anchors.iter().map(|v| v.as_slice()).collect();
+        let p_refs: Vec<&[f32]> = positives.iter().map(|v| v.as_slice()).collect();
+        let out = infonce_loss(&a_refs, &p_refs, temperature);
+
+        check_numerical_gradients_pair(
+            &anchors,
+            &positives,
+            &[],
+            |a, p, _| infonce_loss(a, p, temperature).loss,
+            &out.grad_anchors,
+            &out.grad_positives,
+            &[],
+            1e-4,
+            5e-2,
+            "infonce",
+        );
+    }
+
+    #[test]
+    fn test_mnrl_gradient_numerical() {
+        let anchors: Vec<Vec<f32>> = vec![vec![0.7, 0.3, -0.2], vec![-0.3, 0.8, 0.1]];
+        let positives: Vec<Vec<f32>> = vec![vec![0.5, 0.4, -0.1], vec![-0.2, 0.7, 0.3]];
+        let negatives: Vec<Vec<f32>> = vec![vec![0.1, -0.5, 0.6]];
+        let temperature = 0.1;
+
+        let a_refs: Vec<&[f32]> = anchors.iter().map(|v| v.as_slice()).collect();
+        let p_refs: Vec<&[f32]> = positives.iter().map(|v| v.as_slice()).collect();
+        let n_refs: Vec<&[f32]> = negatives.iter().map(|v| v.as_slice()).collect();
+        let out = mnrl_loss(&a_refs, &p_refs, &n_refs, temperature);
+
+        check_numerical_gradients_pair(
+            &anchors,
+            &positives,
+            &negatives,
+            |a, p, n| mnrl_loss(a, p, n, temperature).loss,
+            &out.grad_anchors,
+            &out.grad_positives,
+            &out.grad_negatives,
+            1e-4,
+            5e-2,
+            "mnrl",
+        );
+    }
+
+    #[test]
+    fn test_contrastive_gradient_numerical() {
+        let a_vecs: Vec<Vec<f32>> = vec![vec![0.7, 0.3], vec![0.1, -0.5]];
+        let b_vecs: Vec<Vec<f32>> = vec![vec![0.5, 0.8], vec![-0.3, 0.2]];
+        let labels = [true, false];
+        let margin = 1.0;
+
+        let pairs: Vec<(&[f32], &[f32])> = a_vecs
+            .iter()
+            .zip(b_vecs.iter())
+            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+            .collect();
+        let out = contrastive_loss(&pairs, &labels, margin);
+
+        let eps = 1e-4;
+        let tol = 1e-2;
+
+        // Check a gradients
+        for i in 0..a_vecs.len() {
+            for d in 0..a_vecs[i].len() {
+                let mut a_plus = a_vecs.clone();
+                let mut a_minus = a_vecs.clone();
+                a_plus[i][d] += eps;
+                a_minus[i][d] -= eps;
+
+                let pairs_p: Vec<(&[f32], &[f32])> = a_plus
+                    .iter()
+                    .zip(b_vecs.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+                let pairs_m: Vec<(&[f32], &[f32])> = a_minus
+                    .iter()
+                    .zip(b_vecs.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+
+                let numerical = (contrastive_loss(&pairs_p, &labels, margin).loss
+                    - contrastive_loss(&pairs_m, &labels, margin).loss)
+                    / (2.0 * eps);
+                assert!(
+                    (out.grad_anchors[i][d] - numerical).abs() < tol,
+                    "contrastive a[{i}][{d}]: analytical={}, numerical={numerical}",
+                    out.grad_anchors[i][d]
+                );
+            }
+        }
+
+        // Check b gradients
+        for i in 0..b_vecs.len() {
+            for d in 0..b_vecs[i].len() {
+                let mut b_plus = b_vecs.clone();
+                let mut b_minus = b_vecs.clone();
+                b_plus[i][d] += eps;
+                b_minus[i][d] -= eps;
+
+                let pairs_p: Vec<(&[f32], &[f32])> = a_vecs
+                    .iter()
+                    .zip(b_plus.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+                let pairs_m: Vec<(&[f32], &[f32])> = a_vecs
+                    .iter()
+                    .zip(b_minus.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+
+                let numerical = (contrastive_loss(&pairs_p, &labels, margin).loss
+                    - contrastive_loss(&pairs_m, &labels, margin).loss)
+                    / (2.0 * eps);
+                assert!(
+                    (out.grad_positives[i][d] - numerical).abs() < tol,
+                    "contrastive b[{i}][{d}]: analytical={}, numerical={numerical}",
+                    out.grad_positives[i][d]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cosine_embedding_gradient_numerical() {
+        let a_vecs: Vec<Vec<f32>> = vec![vec![0.7, 0.3], vec![0.1, -0.5]];
+        let b_vecs: Vec<Vec<f32>> = vec![vec![0.5, 0.8], vec![-0.3, 0.2]];
+        let labels = [true, false];
+        let margin = 0.0;
+
+        let pairs: Vec<(&[f32], &[f32])> = a_vecs
+            .iter()
+            .zip(b_vecs.iter())
+            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+            .collect();
+        let out = cosine_embedding_loss(&pairs, &labels, margin);
+
+        let eps = 1e-4;
+        let tol = 1e-2;
+
+        for i in 0..a_vecs.len() {
+            for d in 0..a_vecs[i].len() {
+                let mut a_plus = a_vecs.clone();
+                let mut a_minus = a_vecs.clone();
+                a_plus[i][d] += eps;
+                a_minus[i][d] -= eps;
+
+                let pairs_p: Vec<(&[f32], &[f32])> = a_plus
+                    .iter()
+                    .zip(b_vecs.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+                let pairs_m: Vec<(&[f32], &[f32])> = a_minus
+                    .iter()
+                    .zip(b_vecs.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+
+                let numerical = (cosine_embedding_loss(&pairs_p, &labels, margin).loss
+                    - cosine_embedding_loss(&pairs_m, &labels, margin).loss)
+                    / (2.0 * eps);
+                assert!(
+                    (out.grad_anchors[i][d] - numerical).abs() < tol,
+                    "cosine_embedding a[{i}][{d}]: analytical={}, numerical={numerical}",
+                    out.grad_anchors[i][d]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_supcon_gradient_numerical() {
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![0.7, 0.3, -0.2],
+            vec![0.5, 0.8, 0.1],
+            vec![-0.3, 0.1, 0.9],
+            vec![-0.5, 0.2, 0.7],
+        ];
+        let labels = [0, 0, 1, 1];
+        let temperature = 0.1;
+
+        let refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
+        let out = supcon_loss(&refs, &labels, temperature);
+
+        check_numerical_gradients_batch(
+            &embeddings,
+            |embs| supcon_loss(embs, &labels, temperature).loss,
+            &out.grad_anchors,
+            1e-4,
+            5e-2,
+            "supcon",
+        );
+    }
+
+    #[test]
+    fn test_n_pairs_gradient_numerical() {
+        let anchors: Vec<Vec<f32>> = vec![vec![0.7, 0.3, -0.2], vec![-0.3, 0.8, 0.1]];
+        let positives: Vec<Vec<f32>> = vec![vec![0.5, 0.4, -0.1], vec![-0.2, 0.7, 0.3]];
+        let temperature = 0.5;
+
+        let a_refs: Vec<&[f32]> = anchors.iter().map(|v| v.as_slice()).collect();
+        let p_refs: Vec<&[f32]> = positives.iter().map(|v| v.as_slice()).collect();
+        let out = n_pairs_loss(&a_refs, &p_refs, temperature);
+
+        check_numerical_gradients_pair(
+            &anchors,
+            &positives,
+            &[],
+            |a, p, _| n_pairs_loss(a, p, temperature).loss,
+            &out.grad_anchors,
+            &out.grad_positives,
+            &[],
+            1e-4,
+            5e-2,
+            "n_pairs",
+        );
+    }
+
+    #[test]
+    fn test_triplet_cosine_gradient_numerical() {
+        let anchor: Vec<f32> = vec![0.7, 0.3, -0.2];
+        let positive: Vec<f32> = vec![0.5, 0.8, 0.1];
+        let negative: Vec<f32> = vec![-0.3, 0.1, 0.9];
+
+        let out = triplet_loss_with_distance(
+            &[&anchor],
+            &[&positive],
+            &[&negative],
+            1.0,
+            DistanceFn::Cosine,
+        );
+
+        let eps = 1e-4;
+        let tol = 1e-2;
+
+        for d in 0..3 {
+            let mut a_plus = anchor.clone();
+            let mut a_minus = anchor.clone();
+            a_plus[d] += eps;
+            a_minus[d] -= eps;
+
+            let lp = triplet_loss_with_distance(
+                &[&a_plus],
+                &[&positive],
+                &[&negative],
+                1.0,
+                DistanceFn::Cosine,
+            )
+            .loss;
+            let lm = triplet_loss_with_distance(
+                &[&a_minus],
+                &[&positive],
+                &[&negative],
+                1.0,
+                DistanceFn::Cosine,
+            )
+            .loss;
+            let numerical = (lp - lm) / (2.0 * eps);
+            assert!(
+                (out.grad_anchors[0][d] - numerical).abs() < tol,
+                "triplet_cosine anchor[{d}]: analytical={}, numerical={numerical}",
+                out.grad_anchors[0][d]
+            );
+        }
     }
 }

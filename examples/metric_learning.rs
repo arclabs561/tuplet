@@ -191,11 +191,10 @@ fn nn_accuracy(data: &[&[f32]], labels: &[usize]) -> f32 {
     correct as f32 / n as f32
 }
 
+type PairList<'a> = Vec<(&'a [f32], &'a [f32])>;
+
 /// Build similar/dissimilar pair lists from labeled data.
-fn build_pairs<'a>(
-    data: &[&'a [f32]],
-    labels: &[usize],
-) -> (Vec<(&'a [f32], &'a [f32])>, Vec<(&'a [f32], &'a [f32])>) {
+fn build_pairs<'a>(data: &[&'a [f32]], labels: &[usize]) -> (PairList<'a>, PairList<'a>) {
     let n = data.len();
     let mut similar = Vec::new();
     let mut dissimilar = Vec::new();
