@@ -136,8 +136,8 @@ pub(crate) fn accumulate_cosine_grad_pair(
 
 /// L2 normalize a vector in-place. Returns the original norm.
 ///
-/// When the `simd` feature is enabled, uses [`innr::normalize`] for the
-/// normalization and [`innr::norm`] for the norm computation.
+/// When the `simd` feature is enabled, uses `innr::norm` for the norm
+/// computation.
 pub fn l2_normalize(v: &mut [f32]) -> f32 {
     #[cfg(feature = "simd")]
     {
