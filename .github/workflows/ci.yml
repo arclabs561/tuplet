@@ -21,7 +21,7 @@ jobs:
             toolchain: "1.85.0"
           - name: candle
             features: "--features candle"
-            toolchain: "1.85.0"
+            toolchain: nightly
           - name: simd
             features: "--features simd"
             toolchain: nightly
