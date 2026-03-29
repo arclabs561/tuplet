@@ -320,6 +320,189 @@ pub fn cosine_embedding_loss(
     pos_loss.add(&neg_loss)?.mean_all()
 }
 
+/// Multiple Negatives Ranking Loss (MNRL).
+///
+/// Like InfoNCE but with additional explicit negatives beyond in-batch negatives.
+/// `anchors` and `positives` are `[batch, dim]`. `negatives` is `[n_neg, dim]`.
+pub fn mnrl_loss(
+    anchors: &Tensor,
+    positives: &Tensor,
+    negatives: &Tensor,
+    temperature: f32,
+) -> Result<Tensor> {
+    let batch = anchors.dim(0)?;
+
+    // Normalize all
+    let norm = |t: &Tensor| -> Result<Tensor> {
+        let n = t.sqr()?.sum(1)?.sqrt()?.clamp(1e-8, f32::MAX as f64)?;
+        t.broadcast_div(&n.unsqueeze(1)?)
+    };
+    let a_n = norm(anchors)?;
+    let p_n = norm(positives)?;
+    let n_n = norm(negatives)?;
+
+    // Similarities: [batch, batch+n_neg]
+    let sim_pos = a_n.matmul(&p_n.t()?)?;
+    let sim_neg = a_n.matmul(&n_n.t()?)?;
+    let sims = Tensor::cat(&[&sim_pos, &sim_neg], 1)?.affine(1.0 / temperature as f64, 0.0)?;
+
+    // Cross-entropy with target = diagonal of positive block
+    let lse = log_sum_exp(&sims, 1)?;
+    let indices = Tensor::arange(0u32, batch as u32, sims.device())?
+        .to_dtype(candle_core::DType::U32)?
+        .unsqueeze(1)?;
+    let diag = sims.gather(&indices, 1)?.squeeze(1)?;
+    lse.sub(&diag)?.mean_all()
+}
+
+/// Matryoshka loss wrapper for candle tensors.
+///
+/// Computes the inner loss at multiple truncated dimensions and sums weighted results.
+pub fn matryoshka_loss<F>(
+    loss_fn: F,
+    embeddings_a: &Tensor,
+    embeddings_b: &Tensor,
+    dims: &[usize],
+    weights: &[f32],
+) -> Result<Tensor>
+where
+    F: Fn(&Tensor, &Tensor) -> Result<Tensor>,
+{
+    assert_eq!(dims.len(), weights.len());
+    let device = embeddings_a.device();
+    let mut total = Tensor::zeros(&[], candle_core::DType::F32, device)?;
+    for (idx, &trunc_dim) in dims.iter().enumerate() {
+        let a_trunc = embeddings_a.narrow(1, 0, trunc_dim)?;
+        let b_trunc = embeddings_b.narrow(1, 0, trunc_dim)?;
+        let loss = loss_fn(&a_trunc, &b_trunc)?;
+        total = total.add(&loss.affine(weights[idx] as f64, 0.0)?)?;
+    }
+    Ok(total)
+}
+
+/// ArcFace loss (Deng et al. 2019).
+///
+/// Angular margin penalty for classification-to-embedding training.
+/// `embeddings`: `[batch, dim]`, `labels`: `[batch]` (u32 class indices),
+/// `proxies`: `[num_classes, dim]` (learnable class centroids).
+pub fn arcface_loss(
+    embeddings: &Tensor,
+    labels: &Tensor,
+    proxies: &Tensor,
+    scale: f32,
+    margin: f32,
+) -> Result<Tensor> {
+    let batch = embeddings.dim(0)?;
+
+    // L2-normalize embeddings and proxies
+    let norm_e = embeddings
+        .sqr()?
+        .sum(1)?
+        .sqrt()?
+        .clamp(1e-8, f32::MAX as f64)?;
+    let e_normed = embeddings.broadcast_div(&norm_e.unsqueeze(1)?)?;
+    let norm_p = proxies
+        .sqr()?
+        .sum(1)?
+        .sqrt()?
+        .clamp(1e-8, f32::MAX as f64)?;
+    let p_normed = proxies.broadcast_div(&norm_p.unsqueeze(1)?)?;
+
+    // Cosine logits: [batch, num_classes]
+    let logits = e_normed.matmul(&p_normed.t()?)?;
+
+    // Extract target cosines and apply angular margin
+    let target_idx = labels.to_dtype(candle_core::DType::U32)?.unsqueeze(1)?;
+    let cos_target = logits.gather(&target_idx, 1)?.squeeze(1)?;
+
+    // cos(theta + m) = cos(theta)*cos(m) - sin(theta)*sin(m)
+    let cos_m = Tensor::new(&[margin.cos()], logits.device())?;
+    let sin_m = Tensor::new(&[margin.sin()], logits.device())?;
+    let sin_target = cos_target
+        .sqr()?
+        .affine(-1.0, 1.0)?
+        .clamp(0.0, f64::MAX)?
+        .sqrt()?;
+    let cos_target_margin = cos_target
+        .broadcast_mul(&cos_m)?
+        .sub(&sin_target.broadcast_mul(&sin_m)?)?;
+
+    // Replace target logits with margined version
+    // One-hot scatter: create one-hot, multiply by (margined - original), add to logits
+    let num_classes = proxies.dim(0)?;
+    let one_hot = {
+        let zeros = Tensor::zeros(
+            &[batch, num_classes],
+            candle_core::DType::F32,
+            logits.device(),
+        )?;
+        let ones = Tensor::ones(&[batch, 1], candle_core::DType::F32, logits.device())?;
+        zeros.scatter_add(&target_idx, &ones, 1)?
+    };
+    let diff = cos_target_margin.sub(&cos_target)?.unsqueeze(1)?;
+    let logits = logits.add(&one_hot.broadcast_mul(&diff)?)?;
+
+    // Scale + cross-entropy
+    let scaled = logits.affine(scale as f64, 0.0)?;
+    let lse = log_sum_exp(&scaled, 1)?;
+    let target_scaled = scaled.gather(&target_idx, 1)?.squeeze(1)?;
+    lse.sub(&target_scaled)?.mean_all()
+}
+
+/// VICReg loss (Bardes, Ponce, LeCun 2022).
+///
+/// Self-supervised loss: invariance (MSE) + variance (hinge on std) + covariance (decorrelation).
+/// `view_a` and `view_b` are `[batch, dim]` embeddings of the same inputs under two augmentations.
+pub fn vicreg_loss(
+    view_a: &Tensor,
+    view_b: &Tensor,
+    lambda_inv: f32,
+    mu_var: f32,
+    nu_cov: f32,
+) -> Result<Tensor> {
+    let n = view_a.dim(0)? as f64;
+    let dim = view_a.dim(1)? as f64;
+
+    // Invariance: MSE between paired views
+    let inv_loss = view_a.sub(view_b)?.sqr()?.mean_all()?;
+
+    // Center both views
+    let mean_a = view_a.mean(0)?;
+    let mean_b = view_b.mean(0)?;
+    let a_centered = view_a.broadcast_sub(&mean_a)?;
+    let b_centered = view_b.broadcast_sub(&mean_b)?;
+
+    // Variance: hinge on std per dimension, target std >= 1
+    let var_loss = |centered: &Tensor| -> Result<Tensor> {
+        let var = centered.sqr()?.mean(0)?;
+        let std = var.affine(1.0, 1e-4)?.sqrt()?;
+        std.affine(-1.0, 1.0)?.relu()?.mean_all()
+    };
+    let var_a = var_loss(&a_centered)?;
+    let var_b = var_loss(&b_centered)?;
+    let var_total = var_a.add(&var_b)?;
+
+    // Covariance: penalize off-diagonal of covariance matrix
+    let cov_loss = |centered: &Tensor| -> Result<Tensor> {
+        // cov = (centered^T centered) / n
+        let cov = centered.t()?.matmul(centered)?.affine(1.0 / n, 0.0)?;
+        // Zero the diagonal, square, sum, normalize by dim
+        let eye = Tensor::eye(centered.dim(1)?, candle_core::DType::F32, centered.device())?;
+        let off_diag = cov.sub(&cov.mul(&eye)?)?;
+        off_diag.sqr()?.sum_all()?.affine(1.0 / dim, 0.0)
+    };
+    let cov_a = cov_loss(&a_centered)?;
+    let cov_b = cov_loss(&b_centered)?;
+    let cov_total = cov_a.add(&cov_b)?;
+
+    // Weighted sum
+    let total = inv_loss
+        .affine(lambda_inv as f64, 0.0)?
+        .add(&var_total.affine(mu_var as f64, 0.0)?)?
+        .add(&cov_total.affine(nu_cov as f64, 0.0)?)?;
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +750,71 @@ mod tests {
             rel_err < 1e-3,
             "cross-backend n_pairs: f32={f32_loss}, candle={candle_loss}, rel_err={rel_err}"
         );
+    }
+
+    #[test]
+    fn test_mnrl_loss_basic() {
+        let a = tensor(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3]);
+        let p = tensor(&[0.9, 0.1, 0.0, 0.1, 0.9, 0.0], &[2, 3]);
+        let n = tensor(&[-1.0, 0.0, 0.0], &[1, 3]);
+
+        let loss = mnrl_loss(&a, &p, &n, 0.1).unwrap();
+        let val = loss.to_scalar::<f32>().unwrap();
+        assert!(val > 0.0 && val.is_finite(), "mnrl loss: {val}");
+    }
+
+    #[test]
+    fn test_matryoshka_wrapper() {
+        let a = tensor(&[1.0, 0.0, 0.5, 0.2, 0.0, 1.0, 0.3, 0.1], &[2, 4]);
+        let b = tensor(&[0.9, 0.1, 0.4, 0.3, 0.1, 0.9, 0.2, 0.2], &[2, 4]);
+
+        let loss =
+            matryoshka_loss(|a, b| infonce_loss(a, b, 0.1), &a, &b, &[2, 4], &[1.0, 1.0]).unwrap();
+        let val = loss.to_scalar::<f32>().unwrap();
+        assert!(val.is_finite(), "matryoshka loss: {val}");
+    }
+
+    #[test]
+    fn test_arcface_basic() {
+        // Non-aligned embeddings so gradients are non-trivial
+        let emb = tensor(&[0.7, 0.3, 0.2, 0.8], &[2, 2]);
+        let proxies = tensor(&[1.0, 0.0, 0.0, 1.0, -1.0, 0.0], &[3, 2]);
+        let labels = Tensor::from_slice(&[0u32, 1], &[2], &Device::Cpu).unwrap();
+
+        let loss = arcface_loss(&emb, &labels, &proxies, 10.0, 0.3).unwrap();
+        let val = loss.to_scalar::<f32>().unwrap();
+        assert!(val >= 0.0 && val.is_finite(), "arcface loss: {val}");
+    }
+
+    #[test]
+    fn test_arcface_backward() {
+        let var =
+            candle_core::Var::from_slice(&[0.7f32, 0.3, 0.2, 0.8], &[2, 2], &Device::Cpu).unwrap();
+        let proxies = tensor(&[1.0, 0.0, 0.0, 1.0, -1.0, 0.0], &[3, 2]);
+        let labels = Tensor::from_slice(&[0u32, 1], &[2], &Device::Cpu).unwrap();
+
+        let loss = arcface_loss(var.as_tensor(), &labels, &proxies, 10.0, 0.3).unwrap();
+        check_backward("arcface", &loss, &var);
+    }
+
+    #[test]
+    fn test_vicreg_basic() {
+        let a = tensor(&[1.0, 0.0, 0.5, 0.5, 0.0, 1.0], &[3, 2]);
+        let b = tensor(&[0.9, 0.1, 0.4, 0.6, 0.1, 0.9], &[3, 2]);
+
+        let loss = vicreg_loss(&a, &b, 25.0, 25.0, 1.0).unwrap();
+        let val = loss.to_scalar::<f32>().unwrap();
+        assert!(val >= 0.0 && val.is_finite(), "vicreg loss: {val}");
+    }
+
+    #[test]
+    fn test_vicreg_backward() {
+        let var =
+            candle_core::Var::from_slice(&[1.0f32, 0.0, 0.5, 0.5, 0.0, 1.0], &[3, 2], &Device::Cpu)
+                .unwrap();
+        let b = tensor(&[0.9, 0.1, 0.4, 0.6, 0.1, 0.9], &[3, 2]);
+
+        let loss = vicreg_loss(var.as_tensor(), &b, 25.0, 25.0, 1.0).unwrap();
+        check_backward("vicreg", &loss, &var);
     }
 }

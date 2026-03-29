@@ -2,8 +2,8 @@
 # https://github.com/repository-settings/app
 
 repository:
-  description: "Distance metric learning and contrastive losses"
-  homepage: "https://github.com/arclabs561/mahala"
+  description: "Metric learning losses with analytical gradients"
+  homepage: "https://docs.rs/mahala"
   private: false
   has_issues: true
   has_wiki: false
@@ -19,3 +19,4 @@ repository:
     - contrastive-learning
     - mahalanobis
     - triplet-loss
+    - infonce

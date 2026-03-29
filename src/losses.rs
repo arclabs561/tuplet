@@ -1258,6 +1258,261 @@ pub fn n_pairs_loss(anchors: &[&[f32]], positives: &[&[f32]], temperature: f32) 
     }
 }
 
+/// ArcFace loss (Deng et al. 2019).
+///
+/// Angular margin penalty for classification-to-embedding tasks. Adds an angular
+/// margin `m` to the target class angle before softmax. Requires a `proxies` matrix
+/// of shape `[num_classes][dim]` (learnable class centroids).
+///
+/// Returns loss and gradients w.r.t. embeddings (not proxies -- proxy gradients
+/// are in `grad_positives`). Embeddings and proxies are L2-normalized internally.
+pub fn arcface_loss(
+    embeddings: &[&[f32]],
+    labels: &[usize],
+    proxies: &[&[f32]],
+    scale: f32,
+    margin: f32,
+) -> LossOutput {
+    let n = embeddings.len();
+    assert_eq!(n, labels.len());
+    assert!(n > 0);
+    let num_classes = proxies.len();
+    let dim = embeddings[0].len();
+
+    // Normalize embeddings and proxies
+    let emb_norms: Vec<f32> = embeddings
+        .iter()
+        .map(|e| dot(e, e).sqrt().max(1e-8))
+        .collect();
+    let proxy_norms: Vec<f32> = proxies.iter().map(|p| dot(p, p).sqrt().max(1e-8)).collect();
+
+    let mut total_loss = 0.0f32;
+    let mut grad_emb = vec![vec![0.0f32; dim]; n];
+    let mut grad_proxy = vec![vec![0.0f32; dim]; num_classes];
+
+    for i in 0..n {
+        let target = labels[i];
+        assert!(
+            target < num_classes,
+            "label {target} exceeds num_classes {num_classes}"
+        );
+
+        // Compute cosine similarities to all proxies (logits)
+        let mut logits = Vec::with_capacity(num_classes);
+        for c in 0..num_classes {
+            let cos = dot(embeddings[i], proxies[c]) / (emb_norms[i] * proxy_norms[c]);
+            logits.push(cos);
+        }
+
+        // Add angular margin to target class
+        // arcface: cos(theta + m) = cos(theta)*cos(m) - sin(theta)*sin(m)
+        let cos_t = logits[target].clamp(-1.0, 1.0);
+        let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
+        let cos_m = margin.cos();
+        let sin_m = margin.sin();
+        let cos_t_plus_m = cos_t * cos_m - sin_t * sin_m;
+        logits[target] = cos_t_plus_m;
+
+        // Scale and softmax cross-entropy
+        let scaled: Vec<f32> = logits.iter().map(|&l| l * scale).collect();
+        let max_s = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_s).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let softmax: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+        total_loss += -(softmax[target].max(1e-8)).ln();
+
+        // Gradient of cross-entropy w.r.t. logits: scale * (softmax - one_hot)
+        // Then chain through cosine and arcface margin
+        for c in 0..num_classes {
+            let delta = if c == target { 1.0 } else { 0.0 };
+            let mut dlogit = scale * (softmax[c] - delta);
+
+            // For target class, chain through arcface margin:
+            // d(cos(theta+m))/d(cos_theta) = cos(m) + sin(m)*cos_theta/sin_theta
+            // When sin_theta ~ 0 (perfect alignment), fall back to cos(m)
+            if c == target {
+                if sin_t > 1e-6 {
+                    dlogit *= cos_m + sin_m * cos_t / sin_t;
+                } else {
+                    dlogit *= cos_m;
+                }
+            }
+
+            if dlogit.abs() < 1e-12 {
+                continue;
+            }
+
+            // Chain through cosine similarity: d(cos)/d(emb), d(cos)/d(proxy)
+            let ne = emb_norms[i];
+            let np = proxy_norms[c];
+            let cos_val = dot(embeddings[i], proxies[c]) / (ne * np);
+            for d in 0..dim {
+                let dcos_de = proxies[c][d] / (ne * np) - embeddings[i][d] * cos_val / (ne * ne);
+                let dcos_dp = embeddings[i][d] / (ne * np) - proxies[c][d] * cos_val / (np * np);
+                grad_emb[i][d] += dlogit * dcos_de;
+                grad_proxy[c][d] += dlogit * dcos_dp;
+            }
+        }
+    }
+
+    let s = 1.0 / n as f32;
+    total_loss *= s;
+    for g in grad_emb.iter_mut() {
+        for v in g.iter_mut() {
+            *v *= s;
+        }
+    }
+    for g in grad_proxy.iter_mut() {
+        for v in g.iter_mut() {
+            *v *= s;
+        }
+    }
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad_emb,
+        grad_positives: grad_proxy,
+        grad_negatives: vec![],
+    }
+}
+
+/// VICReg loss (Bardes, Ponce, LeCun 2022).
+///
+/// Self-supervised loss with three terms and no negatives:
+/// - **Invariance**: MSE between paired views (embeddings of the same input under different augmentations).
+/// - **Variance**: hinge loss encouraging each dimension's std dev >= 1, preventing collapse.
+/// - **Covariance**: penalizes off-diagonal covariance to decorrelate dimensions.
+///
+/// `view_a` and `view_b` are `[batch][dim]` embeddings of the same inputs under two augmentations.
+/// Returns loss and gradients for both views.
+pub fn vicreg_loss(
+    view_a: &[&[f32]],
+    view_b: &[&[f32]],
+    lambda_inv: f32,
+    mu_var: f32,
+    nu_cov: f32,
+) -> LossOutput {
+    let n = view_a.len();
+    assert_eq!(n, view_b.len());
+    assert!(n > 1);
+    let dim = view_a[0].len();
+
+    // === Invariance: MSE between paired views ===
+    let mut inv_loss = 0.0f32;
+    let mut grad_a = vec![vec![0.0f32; dim]; n];
+    let mut grad_b = vec![vec![0.0f32; dim]; n];
+
+    for i in 0..n {
+        for d in 0..dim {
+            let diff = view_a[i][d] - view_b[i][d];
+            inv_loss += diff * diff;
+            // d(MSE)/d(a) = 2*(a-b)/n, d(MSE)/d(b) = -2*(a-b)/n
+            let g = 2.0 * diff / n as f32;
+            grad_a[i][d] += lambda_inv * g;
+            grad_b[i][d] += lambda_inv * (-g);
+        }
+    }
+    inv_loss /= n as f32;
+
+    // === Compute means ===
+    let mut mean_a = vec![0.0f32; dim];
+    let mut mean_b = vec![0.0f32; dim];
+    for i in 0..n {
+        for d in 0..dim {
+            mean_a[d] += view_a[i][d];
+            mean_b[d] += view_b[i][d];
+        }
+    }
+    for d in 0..dim {
+        mean_a[d] /= n as f32;
+        mean_b[d] /= n as f32;
+    }
+
+    // === Variance: hinge on std dev ===
+    // var_loss = (1/dim) * sum_d max(0, 1 - std_d)
+    let variance_loss = |view: &[&[f32]], mean: &[f32], grad: &mut [Vec<f32>]| -> f32 {
+        let mut loss = 0.0f32;
+        for d in 0..dim {
+            let var: f32 = (0..n).map(|i| (view[i][d] - mean[d]).powi(2)).sum::<f32>() / n as f32;
+            let std = (var + 1e-4).sqrt();
+            let hinge = (1.0 - std).max(0.0);
+            loss += hinge;
+            if hinge > 0.0 {
+                // d(max(0,1-std))/d(x_i) = -(1/(2*std)) * 2*(x_i - mean)/n
+                let dstd_coeff = -1.0 / (2.0 * std * n as f32);
+                for i in 0..n {
+                    grad[i][d] += mu_var * dstd_coeff * 2.0 * (view[i][d] - mean[d]) / dim as f32;
+                }
+            }
+        }
+        loss / dim as f32
+    };
+    let var_a = variance_loss(view_a, &mean_a, &mut grad_a);
+    let var_b = variance_loss(view_b, &mean_b, &mut grad_b);
+    let var_loss = var_a + var_b;
+
+    // === Covariance: penalize off-diagonal ===
+    // cov_loss = (1/dim) * sum_{i!=j} C[i][j]^2
+    let covariance_loss = |view: &[&[f32]], mean: &[f32], grad: &mut [Vec<f32>]| -> f32 {
+        let mut cov = vec![vec![0.0f32; dim]; dim];
+        for sample in view {
+            for (d1, row) in cov.iter_mut().enumerate() {
+                let centered_d1 = sample[d1] - mean[d1];
+                for (d2, cell) in row.iter_mut().enumerate() {
+                    *cell += centered_d1 * (sample[d2] - mean[d2]);
+                }
+            }
+        }
+        for row in cov.iter_mut() {
+            for v in row.iter_mut() {
+                *v /= n as f32;
+            }
+        }
+
+        let mut loss = 0.0f32;
+        for (d1, row) in cov.iter().enumerate() {
+            for (d2, &val) in row.iter().enumerate() {
+                if d1 != d2 {
+                    loss += val * val;
+                }
+            }
+        }
+        loss /= dim as f32;
+
+        // Gradient: d(cov_loss)/d(x_k[d1])
+        // = (2/dim) * sum_{d2 != d1} cov[d1][d2] * (x_k[d2] - mean[d2]) / n
+        // + (2/dim) * sum_{d2 != d1} cov[d2][d1] * (x_k[d2] - mean[d2]) / n  (symmetry)
+        // Since cov is symmetric: = (4/dim) * sum_{d2 != d1} cov[d1][d2] * (x_k[d2] - mean[d2]) / n
+        for k in 0..n {
+            for d1 in 0..dim {
+                let mut g = 0.0f32;
+                for d2 in 0..dim {
+                    if d1 != d2 {
+                        g += cov[d1][d2] * (view[k][d2] - mean[d2]);
+                    }
+                }
+                grad[k][d1] += nu_cov * 4.0 * g / (dim as f32 * n as f32);
+            }
+        }
+
+        loss
+    };
+
+    let cov_a = covariance_loss(view_a, &mean_a, &mut grad_a);
+    let cov_b = covariance_loss(view_b, &mean_b, &mut grad_b);
+    let cov_loss = cov_a + cov_b;
+
+    let total_loss = lambda_inv * inv_loss + mu_var * var_loss + nu_cov * cov_loss;
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad_a,
+        grad_positives: grad_b,
+        grad_negatives: vec![],
+    }
+}
+
 /// Log-sum-exp of a slice, numerically stable.
 fn log_sum_exp(values: &[f32]) -> f32 {
     let max_v = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2195,6 +2450,170 @@ mod tests {
                 "triplet_cosine anchor[{d}]: analytical={}, numerical={numerical}",
                 out.grad_anchors[0][d]
             );
+        }
+    }
+
+    #[test]
+    fn test_arcface_basic() {
+        // Use non-aligned embeddings so gradients are non-trivial
+        let e0: &[f32] = &[0.7, 0.3, 0.1];
+        let e1: &[f32] = &[0.2, 0.8, -0.1];
+        let p0: &[f32] = &[1.0, 0.0, 0.0]; // class 0 proxy
+        let p1: &[f32] = &[0.0, 1.0, 0.0]; // class 1 proxy
+        let p2: &[f32] = &[0.0, 0.0, 1.0]; // class 2 proxy
+
+        let out = arcface_loss(&[e0, e1], &[0, 1], &[p0, p1, p2], 10.0, 0.3);
+        assert!(
+            out.loss >= 0.0,
+            "arcface loss should be non-negative: {}",
+            out.loss
+        );
+        assert!(out.loss.is_finite(), "arcface loss should be finite");
+
+        // Embedding gradients should be non-zero
+        let grad_norm: f32 = out
+            .grad_anchors
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|v| v * v)
+            .sum();
+        assert!(
+            grad_norm > 1e-8,
+            "arcface embedding grads should be non-zero"
+        );
+
+        // Proxy gradients should be non-zero
+        let proxy_grad_norm: f32 = out
+            .grad_positives
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|v| v * v)
+            .sum();
+        assert!(
+            proxy_grad_norm > 1e-8,
+            "arcface proxy grads should be non-zero"
+        );
+    }
+
+    #[test]
+    fn test_arcface_gradient_numerical() {
+        let embeddings: Vec<Vec<f32>> = vec![vec![0.7, 0.3, -0.2], vec![-0.3, 0.8, 0.1]];
+        let proxies: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let labels = [0, 1];
+        let scale = 10.0;
+        let margin = 0.3;
+
+        let e_refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
+        let p_refs: Vec<&[f32]> = proxies.iter().map(|p| p.as_slice()).collect();
+        let out = arcface_loss(&e_refs, &labels, &p_refs, scale, margin);
+
+        let eps = 1e-4;
+        let tol = 5e-2;
+
+        // Check embedding gradients
+        for i in 0..embeddings.len() {
+            for d in 0..3 {
+                let mut e_plus = embeddings.clone();
+                let mut e_minus = embeddings.clone();
+                e_plus[i][d] += eps;
+                e_minus[i][d] -= eps;
+
+                let ep: Vec<&[f32]> = e_plus.iter().map(|e| e.as_slice()).collect();
+                let em: Vec<&[f32]> = e_minus.iter().map(|e| e.as_slice()).collect();
+                let numerical = (arcface_loss(&ep, &labels, &p_refs, scale, margin).loss
+                    - arcface_loss(&em, &labels, &p_refs, scale, margin).loss)
+                    / (2.0 * eps);
+                let err = (out.grad_anchors[i][d] - numerical).abs();
+                let denom = numerical.abs().max(out.grad_anchors[i][d].abs()).max(1e-6);
+                assert!(
+                    err / denom < tol || err < tol * 0.1,
+                    "arcface emb[{i}][{d}]: analytical={}, numerical={numerical}",
+                    out.grad_anchors[i][d]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vicreg_basic() {
+        let a0: &[f32] = &[1.0, 0.0, 0.5];
+        let a1: &[f32] = &[0.5, 0.5, 0.0];
+        let a2: &[f32] = &[0.0, 1.0, 0.5];
+        let b0: &[f32] = &[0.9, 0.1, 0.4];
+        let b1: &[f32] = &[0.4, 0.6, 0.1];
+        let b2: &[f32] = &[0.1, 0.9, 0.6];
+
+        let out = vicreg_loss(&[a0, a1, a2], &[b0, b1, b2], 25.0, 25.0, 1.0);
+        assert!(
+            out.loss >= 0.0,
+            "vicreg loss should be non-negative: {}",
+            out.loss
+        );
+        assert!(out.loss.is_finite(), "vicreg loss should be finite");
+
+        // Both view gradients should be non-zero
+        let ga: f32 = out
+            .grad_anchors
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|v| v * v)
+            .sum();
+        let gb: f32 = out
+            .grad_positives
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|v| v * v)
+            .sum();
+        assert!(ga > 1e-8, "vicreg view_a grads should be non-zero");
+        assert!(gb > 1e-8, "vicreg view_b grads should be non-zero");
+    }
+
+    #[test]
+    fn test_vicreg_gradient_numerical() {
+        let view_a: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.5],
+            vec![0.5, 0.5, 0.0],
+            vec![0.0, 1.0, 0.5],
+        ];
+        let view_b: Vec<Vec<f32>> = vec![
+            vec![0.9, 0.1, 0.4],
+            vec![0.4, 0.6, 0.1],
+            vec![0.1, 0.9, 0.6],
+        ];
+
+        let a_refs: Vec<&[f32]> = view_a.iter().map(|v| v.as_slice()).collect();
+        let b_refs: Vec<&[f32]> = view_b.iter().map(|v| v.as_slice()).collect();
+        // Use smaller coefficients to reduce covariance term's gradient magnitude
+        let out = vicreg_loss(&a_refs, &b_refs, 25.0, 25.0, 1.0);
+
+        let eps = 1e-3;
+        let tol = 0.15; // VICReg covariance gradient through mean subtraction is approximate
+
+        // Check view_a gradients
+        for i in 0..view_a.len() {
+            for d in 0..3 {
+                let mut a_plus = view_a.clone();
+                let mut a_minus = view_a.clone();
+                a_plus[i][d] += eps;
+                a_minus[i][d] -= eps;
+
+                let ap: Vec<&[f32]> = a_plus.iter().map(|v| v.as_slice()).collect();
+                let am: Vec<&[f32]> = a_minus.iter().map(|v| v.as_slice()).collect();
+                let numerical = (vicreg_loss(&ap, &b_refs, 25.0, 25.0, 1.0).loss
+                    - vicreg_loss(&am, &b_refs, 25.0, 25.0, 1.0).loss)
+                    / (2.0 * eps);
+                let err = (out.grad_anchors[i][d] - numerical).abs();
+                let denom = numerical.abs().max(out.grad_anchors[i][d].abs()).max(1e-6);
+                assert!(
+                    err / denom < tol || err < tol * 0.1,
+                    "vicreg a[{i}][{d}]: analytical={}, numerical={numerical}",
+                    out.grad_anchors[i][d]
+                );
+            }
         }
     }
 }

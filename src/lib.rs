@@ -8,9 +8,9 @@ pub mod similarity;
 pub mod candle_losses;
 
 pub use losses::{
-    DistanceFn, LossOutput, circle_loss, contrastive_loss, cosine_embedding_loss, infonce_loss,
-    lifted_structured_loss, matryoshka_loss, mnrl_loss, multi_similarity_loss, n_pairs_loss,
-    supcon_loss, triplet_loss, triplet_loss_with_distance,
+    DistanceFn, LossOutput, arcface_loss, circle_loss, contrastive_loss, cosine_embedding_loss,
+    infonce_loss, lifted_structured_loss, matryoshka_loss, mnrl_loss, multi_similarity_loss,
+    n_pairs_loss, supcon_loss, triplet_loss, triplet_loss_with_distance, vicreg_loss,
 };
 pub use mahalanobis::{
     ItmlConfig, LmnnConfig, MahalanobisConfig, NcaConfig, itml, kissme, learn_mahalanobis,
