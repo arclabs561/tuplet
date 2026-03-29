@@ -13,20 +13,27 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: default
             features: ""
-          - name: simd
-            features: "--features simd"
+            toolchain: "1.85.0"
           - name: candle
             features: "--features candle"
+            toolchain: "1.85.0"
+          - name: simd
+            features: "--features simd"
+            toolchain: nightly
           - name: all
             features: "--all-features"
+            toolchain: nightly
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
@@ -48,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
