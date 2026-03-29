@@ -884,13 +884,15 @@ pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: 
     total_loss /= n as f32;
 
     // Gradients with full alpha dependency (not detached).
-    // logit_n = gamma * alpha_n * (s_n - delta_n) where alpha_n = max(0, s_n - O_n)
-    // When alpha_n > 0: d(logit_n)/d(s_n) = gamma * (2*s_n - delta_n - O_n)
-    // When alpha_n = 0: d(logit_n)/d(s_n) = 0
+    // This computes the true gradient of the implemented function. Note: pytorch-metric-learning
+    // detaches alpha (treats it as constant during backprop), which is a practical choice from
+    // the paper but not mathematically required. The candle_losses module detaches alpha to
+    // match the reference implementation; this f32 module computes the exact gradient.
     //
-    // logit_p = -gamma * alpha_p * (s_p - delta_p) where alpha_p = max(0, O_p - s_p)
+    // logit_n = gamma * max(0, s_n - O_n) * (s_n - delta_n)
+    // When alpha_n > 0: d(logit_n)/d(s_n) = gamma * (2*s_n - delta_n - O_n)
+    // logit_p = -gamma * max(0, O_p - s_p) * (s_p - delta_p)
     // When alpha_p > 0: d(logit_p)/d(s_p) = -gamma * (O_p - 2*s_p + delta_p)
-    // When alpha_p = 0: d(logit_p)/d(s_p) = 0
     //
     // dL/d(s) = sigmoid(combined) * softmax_weight * d(logit)/d(s)
     // Then chain through d(cosine)/d(embedding).
@@ -2065,6 +2067,36 @@ mod tests {
                     (out.grad_anchors[i][d] - numerical).abs() < tol,
                     "cosine_embedding a[{i}][{d}]: analytical={}, numerical={numerical}",
                     out.grad_anchors[i][d]
+                );
+            }
+        }
+
+        // Check b-side gradients
+        for i in 0..b_vecs.len() {
+            for d in 0..b_vecs[i].len() {
+                let mut b_plus = b_vecs.clone();
+                let mut b_minus = b_vecs.clone();
+                b_plus[i][d] += eps;
+                b_minus[i][d] -= eps;
+
+                let pairs_p: Vec<(&[f32], &[f32])> = a_vecs
+                    .iter()
+                    .zip(b_plus.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+                let pairs_m: Vec<(&[f32], &[f32])> = a_vecs
+                    .iter()
+                    .zip(b_minus.iter())
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .collect();
+
+                let numerical = (cosine_embedding_loss(&pairs_p, &labels, margin).loss
+                    - cosine_embedding_loss(&pairs_m, &labels, margin).loss)
+                    / (2.0 * eps);
+                assert!(
+                    (out.grad_positives[i][d] - numerical).abs() < tol,
+                    "cosine_embedding b[{i}][{d}]: analytical={}, numerical={numerical}",
+                    out.grad_positives[i][d]
                 );
             }
         }

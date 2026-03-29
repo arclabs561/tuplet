@@ -249,14 +249,12 @@ pub fn circle_loss(
     let lse_neg = log_sum_exp(&neg_logits, 1)?;
     let lse_pos = log_sum_exp(&pos_logits, 1)?;
     let combined = lse_neg.add(&lse_pos)?;
-    // softplus: log(1 + exp(x)), use the identity: softplus(x) = x + log(1 + exp(-x))
-    // for numerical stability when x is large
+    // softplus(x) = max(x, 0) + log(1 + exp(-|x|))
+    // This formulation avoids exp overflow for both large positive and large negative x.
+    let abs_combined = combined.abs()?;
     let softplus = combined
-        .neg()?
-        .exp()?
-        .affine(1.0, 1.0)?
-        .log()?
-        .add(&combined)?;
+        .relu()?
+        .add(&abs_combined.neg()?.exp()?.affine(1.0, 1.0)?.log()?)?;
 
     softplus.mean_all()
 }
@@ -429,6 +427,145 @@ mod tests {
         assert!(
             grad_sum > 1e-6,
             "gradients should be non-zero, got sum={grad_sum}"
+        );
+    }
+
+    /// Helper to check candle backward produces non-zero gradients.
+    fn check_backward(name: &str, loss: &Tensor, var: &candle_core::Var) {
+        let grads = loss.backward().unwrap();
+        let grad = grads.get(var.as_tensor()).unwrap();
+        let grad_sum: f32 = grad
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|x| x.abs())
+            .sum();
+        assert!(
+            grad_sum > 1e-6,
+            "{name}: gradients should be non-zero, got sum={grad_sum}"
+        );
+    }
+
+    #[test]
+    fn test_supcon_backward() {
+        let var = candle_core::Var::from_slice(
+            &[1.0f32, 0.0, 0.9, 0.1, 0.0, 1.0, 0.1, 0.9],
+            &[4, 2],
+            &Device::Cpu,
+        )
+        .unwrap();
+        let labels = Tensor::from_slice(&[0u32, 0, 1, 1], &[4], &Device::Cpu).unwrap();
+        let loss = supcon_loss(var.as_tensor(), &labels, 0.1).unwrap();
+        check_backward("supcon", &loss, &var);
+    }
+
+    #[test]
+    fn test_multi_similarity_backward() {
+        let var = candle_core::Var::from_slice(
+            &[1.0f32, 0.0, 0.9, 0.1, 0.0, 1.0, 0.1, 0.9],
+            &[4, 2],
+            &Device::Cpu,
+        )
+        .unwrap();
+        let labels = Tensor::from_slice(&[0u32, 0, 1, 1], &[4], &Device::Cpu).unwrap();
+        let loss = multi_similarity_loss(var.as_tensor(), &labels, 2.0, 50.0, 0.5).unwrap();
+        check_backward("multi_similarity", &loss, &var);
+    }
+
+    #[test]
+    fn test_circle_backward() {
+        let var = candle_core::Var::from_slice(
+            &[1.0f32, 0.0, 0.9, 0.1, 0.0, 1.0, 0.1, 0.9],
+            &[4, 2],
+            &Device::Cpu,
+        )
+        .unwrap();
+        let labels = Tensor::from_slice(&[0u32, 0, 1, 1], &[4], &Device::Cpu).unwrap();
+        let loss = circle_loss(var.as_tensor(), &labels, 0.25, 64.0).unwrap();
+        check_backward("circle", &loss, &var);
+    }
+
+    #[test]
+    fn test_cross_backend_infonce() {
+        // Verify f32 and candle produce the same loss value for identical inputs
+        let a_data = [0.7f32, 0.3, -0.2, -0.3, 0.8, 0.1];
+        let p_data = [0.5f32, 0.4, -0.1, -0.2, 0.7, 0.3];
+        let temperature = 0.1;
+
+        // f32 path
+        let a_refs: Vec<&[f32]> = vec![&a_data[0..3], &a_data[3..6]];
+        let p_refs: Vec<&[f32]> = vec![&p_data[0..3], &p_data[3..6]];
+        let f32_loss = crate::losses::infonce_loss(&a_refs, &p_refs, temperature).loss;
+
+        // candle path
+        let a_tensor = tensor(&a_data, &[2, 3]);
+        let p_tensor = tensor(&p_data, &[2, 3]);
+        let candle_loss = infonce_loss(&a_tensor, &p_tensor, temperature)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        let rel_err = (f32_loss - candle_loss).abs() / f32_loss.abs().max(1e-6);
+        assert!(
+            rel_err < 1e-3,
+            "cross-backend infonce: f32={f32_loss}, candle={candle_loss}, rel_err={rel_err}"
+        );
+    }
+
+    #[test]
+    fn test_cross_backend_triplet() {
+        let a_data = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let p_data = [0.9f32, 0.1, 0.0, 0.1, 0.9, 0.0];
+        let n_data = [-1.0f32, 0.0, 0.0, 0.0, -1.0, 0.0];
+        let margin = 0.5;
+
+        let a_refs: Vec<&[f32]> = vec![&a_data[0..3], &a_data[3..6]];
+        let p_refs: Vec<&[f32]> = vec![&p_data[0..3], &p_data[3..6]];
+        let n_refs: Vec<&[f32]> = vec![&n_data[0..3], &n_data[3..6]];
+        let f32_loss = crate::losses::triplet_loss(&a_refs, &p_refs, &n_refs, margin).loss;
+
+        let candle_loss = triplet_loss(
+            &tensor(&a_data, &[2, 3]),
+            &tensor(&p_data, &[2, 3]),
+            &tensor(&n_data, &[2, 3]),
+            margin,
+        )
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+
+        let rel_err = (f32_loss - candle_loss).abs() / f32_loss.abs().max(1e-6);
+        assert!(
+            rel_err < 1e-3,
+            "cross-backend triplet: f32={f32_loss}, candle={candle_loss}, rel_err={rel_err}"
+        );
+    }
+
+    #[test]
+    fn test_cross_backend_n_pairs() {
+        let a_data = [0.7f32, 0.3, -0.2, -0.3, 0.8, 0.1];
+        let p_data = [0.5f32, 0.4, -0.1, -0.2, 0.7, 0.3];
+        let temperature = 0.5;
+
+        let a_refs: Vec<&[f32]> = vec![&a_data[0..3], &a_data[3..6]];
+        let p_refs: Vec<&[f32]> = vec![&p_data[0..3], &p_data[3..6]];
+        let f32_loss = crate::losses::n_pairs_loss(&a_refs, &p_refs, temperature).loss;
+
+        let candle_loss = n_pairs_loss(
+            &tensor(&a_data, &[2, 3]),
+            &tensor(&p_data, &[2, 3]),
+            temperature,
+        )
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+
+        let rel_err = (f32_loss - candle_loss).abs() / f32_loss.abs().max(1e-6);
+        assert!(
+            rel_err < 1e-3,
+            "cross-backend n_pairs: f32={f32_loss}, candle={candle_loss}, rel_err={rel_err}"
         );
     }
 }

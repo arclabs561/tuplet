@@ -29,3 +29,7 @@ candle = ["dep:candle-core"]
 mining = ["dep:rand"]
 serde = ["dep:serde"]
 simd = ["dep:innr"]
+
+[[example]]
+name = "candle_training"
+required-features = ["candle"]
