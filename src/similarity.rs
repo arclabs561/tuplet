@@ -1,30 +1,54 @@
 /// Dot product of two vectors.
+///
+/// When the `simd` feature is enabled, delegates to [`innr::dot`] for
+/// hardware-accelerated computation (AVX-512, AVX2, NEON).
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "vectors must have equal length");
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    #[cfg(feature = "simd")]
+    {
+        innr::dot(a, b)
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        assert_eq!(a.len(), b.len(), "vectors must have equal length");
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    }
 }
 
 /// Cosine similarity between two vectors.
+///
+/// When the `simd` feature is enabled, delegates to [`innr::cosine`].
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let d = dot(a, b);
-    let norm_a = dot(a, a).sqrt();
-    let norm_b = dot(b, b).sqrt();
-    let denom = norm_a * norm_b;
-    if denom == 0.0 {
-        0.0
-    } else {
-        d / denom
+    #[cfg(feature = "simd")]
+    {
+        innr::cosine(a, b)
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        let d = dot(a, b);
+        let norm_a = dot(a, a).sqrt();
+        let norm_b = dot(b, b).sqrt();
+        let denom = norm_a * norm_b;
+        if denom == 0.0 { 0.0 } else { d / denom }
     }
 }
 
 /// Euclidean distance between two vectors.
+///
+/// When the `simd` feature is enabled, delegates to [`innr::l2_distance`].
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "vectors must have equal length");
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
+    #[cfg(feature = "simd")]
+    {
+        innr::l2_distance(a, b)
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        assert_eq!(a.len(), b.len(), "vectors must have equal length");
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f32>()
+            .sqrt()
+    }
 }
 
 /// Pairwise cosine similarity matrix for a batch of embeddings.
@@ -111,14 +135,31 @@ pub(crate) fn accumulate_cosine_grad_pair(
 }
 
 /// L2 normalize a vector in-place. Returns the original norm.
+///
+/// When the `simd` feature is enabled, uses [`innr::normalize`] for the
+/// normalization and [`innr::norm`] for the norm computation.
 pub fn l2_normalize(v: &mut [f32]) -> f32 {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in v.iter_mut() {
-            *x /= norm;
+    #[cfg(feature = "simd")]
+    {
+        let n = innr::norm(v);
+        if n > 0.0 {
+            let inv = 1.0 / n;
+            for x in v.iter_mut() {
+                *x *= inv;
+            }
         }
+        n
     }
-    norm
+    #[cfg(not(feature = "simd"))]
+    {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+        norm
+    }
 }
 
 #[cfg(test)]
@@ -175,7 +216,6 @@ mod tests {
         assert_eq!(mat.len(), 3);
         assert_eq!(mat[0].len(), 3);
 
-        // Diagonal should be 1.0
         for (i, row) in mat.iter().enumerate() {
             assert!(
                 (row[i] - 1.0).abs() < 1e-6,
@@ -184,7 +224,6 @@ mod tests {
             );
         }
 
-        // Symmetry
         for (i, row_i) in mat.iter().enumerate() {
             for (j, row_j) in mat.iter().enumerate() {
                 assert!(

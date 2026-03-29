@@ -4,14 +4,17 @@ pub mod mahalanobis;
 pub mod mining;
 pub mod similarity;
 
+#[cfg(feature = "candle")]
+pub mod candle_losses;
+
 pub use losses::{
-    circle_loss, contrastive_loss, cosine_embedding_loss, infonce_loss, lifted_structured_loss,
-    matryoshka_loss, mnrl_loss, multi_similarity_loss, n_pairs_loss, supcon_loss, triplet_loss,
-    triplet_loss_with_distance, DistanceFn, LossOutput,
+    DistanceFn, LossOutput, circle_loss, contrastive_loss, cosine_embedding_loss, infonce_loss,
+    lifted_structured_loss, matryoshka_loss, mnrl_loss, multi_similarity_loss, n_pairs_loss,
+    supcon_loss, triplet_loss, triplet_loss_with_distance,
 };
 pub use mahalanobis::{
-    itml, kissme, learn_mahalanobis, learn_transform, lmnn, mahalanobis_distance, nca, transform,
-    transform_batch, ItmlConfig, LmnnConfig, MahalanobisConfig, NcaConfig,
+    ItmlConfig, LmnnConfig, MahalanobisConfig, NcaConfig, itml, kissme, learn_mahalanobis,
+    learn_transform, lmnn, mahalanobis_distance, nca, transform, transform_batch,
 };
 #[cfg(feature = "mining")]
 pub use mining::{
