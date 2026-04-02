@@ -1513,6 +1513,218 @@ pub fn vicreg_loss(
     }
 }
 
+/// Proxy-Anchor Loss (Kim et al. 2020).
+///
+/// Each class has a learnable proxy embedding. For each proxy, the loss pulls
+/// same-class embeddings closer and pushes different-class embeddings away.
+/// O(N*C) complexity instead of O(N^2).
+///
+/// `embeddings`: `[batch][dim]`, `labels`: class indices, `proxies`: `[num_classes][dim]`.
+/// Returns loss and gradients. `grad_anchors` = embedding gradients, `grad_positives` = proxy gradients.
+pub fn proxy_anchor_loss(
+    embeddings: &[&[f32]],
+    labels: &[usize],
+    proxies: &[&[f32]],
+    margin: f32,
+    alpha: f32,
+) -> LossOutput {
+    let n = embeddings.len();
+    let num_classes = proxies.len();
+    assert_eq!(n, labels.len());
+    assert!(n > 0);
+    let dim = embeddings[0].len();
+
+    // Precompute norms
+    let e_norms: Vec<f32> = embeddings
+        .iter()
+        .map(|e| dot(e, e).sqrt().max(1e-8))
+        .collect();
+    let p_norms: Vec<f32> = proxies.iter().map(|p| dot(p, p).sqrt().max(1e-8)).collect();
+
+    // Cosine similarity matrix [num_classes, batch]
+    let mut sims = vec![vec![0.0f32; n]; num_classes];
+    for c in 0..num_classes {
+        for i in 0..n {
+            sims[c][i] = dot(proxies[c], embeddings[i]) / (p_norms[c] * e_norms[i]);
+        }
+    }
+
+    let mut total_loss = 0.0f32;
+    let mut grad_emb = vec![vec![0.0f32; dim]; n];
+    let mut grad_proxy = vec![vec![0.0f32; dim]; num_classes];
+
+    // Which classes are present in the batch?
+    let mut classes_present = vec![false; num_classes];
+    for &l in labels {
+        if l < num_classes {
+            classes_present[l] = true;
+        }
+    }
+
+    for c in 0..num_classes {
+        if !classes_present[c] {
+            continue;
+        }
+
+        let pos_indices: Vec<usize> = (0..n).filter(|&i| labels[i] == c).collect();
+        let neg_indices: Vec<usize> = (0..n).filter(|&i| labels[i] != c).collect();
+
+        // Positive term: softplus(-alpha * (logsumexp(alpha * (s - margin)) over positives))
+        // = log(1 + exp(-alpha * lse_pos))
+        if !pos_indices.is_empty() {
+            let pos_logits: Vec<f32> = pos_indices
+                .iter()
+                .map(|&i| alpha * (sims[c][i] - margin))
+                .collect();
+            let lse_pos = log_sum_exp(&pos_logits);
+            let sp_arg = -lse_pos; // softplus(-lse)
+            let sp = if sp_arg > 20.0 {
+                sp_arg
+            } else {
+                (1.0 + sp_arg.exp()).ln()
+            };
+            total_loss += sp;
+
+            // Gradient: d(softplus(-lse))/d(s_i) = -sigmoid(-lse) * alpha * softmax_weight_i
+            let sigmoid_neg_lse = 1.0 / (1.0 + lse_pos.exp());
+            let max_pl = pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let pos_exps: Vec<f32> = pos_logits.iter().map(|&v| (v - max_pl).exp()).collect();
+            let sum_pe: f32 = pos_exps.iter().sum();
+
+            for (pi, &i) in pos_indices.iter().enumerate() {
+                let w = pos_exps[pi] / sum_pe;
+                let dsim = -sigmoid_neg_lse * alpha * w;
+                accumulate_cosine_grad(
+                    proxies[c],
+                    embeddings[i],
+                    sims[c][i],
+                    p_norms[c],
+                    e_norms[i],
+                    dsim,
+                    &mut grad_proxy[c],
+                    &mut grad_emb[i],
+                );
+            }
+        }
+
+        // Negative term: softplus(alpha * (logsumexp(alpha * (margin + s)) over negatives))
+        if !neg_indices.is_empty() {
+            let neg_logits: Vec<f32> = neg_indices
+                .iter()
+                .map(|&i| alpha * (sims[c][i] + margin))
+                .collect();
+            let lse_neg = log_sum_exp(&neg_logits);
+            let sp_arg = lse_neg;
+            let sp = if sp_arg > 20.0 {
+                sp_arg
+            } else {
+                (1.0 + sp_arg.exp()).ln()
+            };
+            total_loss += sp;
+
+            // Gradient: d(softplus(lse))/d(s_i) = sigmoid(lse) * alpha * softmax_weight_i
+            let sigmoid_lse = 1.0 / (1.0 + (-lse_neg).exp());
+            let max_nl = neg_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let neg_exps: Vec<f32> = neg_logits.iter().map(|&v| (v - max_nl).exp()).collect();
+            let sum_ne: f32 = neg_exps.iter().sum();
+
+            for (ni, &i) in neg_indices.iter().enumerate() {
+                let w = neg_exps[ni] / sum_ne;
+                let dsim = sigmoid_lse * alpha * w;
+                accumulate_cosine_grad(
+                    proxies[c],
+                    embeddings[i],
+                    sims[c][i],
+                    p_norms[c],
+                    e_norms[i],
+                    dsim,
+                    &mut grad_proxy[c],
+                    &mut grad_emb[i],
+                );
+            }
+        }
+    }
+
+    let s = 1.0 / num_classes as f32;
+    total_loss *= s;
+    for g in grad_emb.iter_mut() {
+        for v in g.iter_mut() {
+            *v *= s;
+        }
+    }
+    for g in grad_proxy.iter_mut() {
+        for v in g.iter_mut() {
+            *v *= s;
+        }
+    }
+
+    LossOutput {
+        loss: total_loss,
+        grad_anchors: grad_emb,
+        grad_positives: grad_proxy,
+        grad_negatives: vec![],
+    }
+}
+
+/// Cross-batch memory buffer for expanding the negative pool.
+///
+/// Maintains a FIFO queue of past embeddings. Call [`enqueue`](CrossBatchMemory::enqueue)
+/// after each batch to add the current batch's embeddings. Use [`negatives`](CrossBatchMemory::negatives)
+/// to get the full memory bank as negative candidates for any pair-based loss.
+#[derive(Debug, Clone)]
+pub struct CrossBatchMemory {
+    buffer: Vec<Vec<f32>>,
+    labels: Vec<usize>,
+    capacity: usize,
+    dim: usize,
+}
+
+impl CrossBatchMemory {
+    /// Create a new memory buffer.
+    pub fn new(capacity: usize, dim: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+            labels: Vec::with_capacity(capacity),
+            capacity,
+            dim,
+        }
+    }
+
+    /// Add a batch of embeddings to the memory. Oldest entries are evicted when full.
+    pub fn enqueue(&mut self, embeddings: &[&[f32]], labels: &[usize]) {
+        assert_eq!(embeddings.len(), labels.len());
+        for (emb, &label) in embeddings.iter().zip(labels.iter()) {
+            assert_eq!(emb.len(), self.dim);
+            if self.buffer.len() >= self.capacity {
+                self.buffer.remove(0);
+                self.labels.remove(0);
+            }
+            self.buffer.push(emb.to_vec());
+            self.labels.push(label);
+        }
+    }
+
+    /// Get all stored embeddings as slice references.
+    pub fn embeddings(&self) -> Vec<&[f32]> {
+        self.buffer.iter().map(|v| v.as_slice()).collect()
+    }
+
+    /// Get all stored labels.
+    pub fn memory_labels(&self) -> &[usize] {
+        &self.labels
+    }
+
+    /// Number of embeddings currently stored.
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+}
+
 /// Log-sum-exp of a slice, numerically stable.
 fn log_sum_exp(values: &[f32]) -> f32 {
     let max_v = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -2615,5 +2827,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_proxy_anchor_basic() {
+        let e0: &[f32] = &[0.7, 0.3, 0.1];
+        let e1: &[f32] = &[0.2, 0.8, -0.1];
+        let p0: &[f32] = &[1.0, 0.0, 0.0];
+        let p1: &[f32] = &[0.0, 1.0, 0.0];
+        let p2: &[f32] = &[0.0, 0.0, 1.0];
+
+        let out = proxy_anchor_loss(&[e0, e1], &[0, 1], &[p0, p1, p2], 0.1, 32.0);
+        assert!(out.loss.is_finite(), "proxy_anchor loss: {}", out.loss);
+
+        let grad_norm: f32 = out
+            .grad_anchors
+            .iter()
+            .flat_map(|g| g.iter())
+            .map(|v| v * v)
+            .sum();
+        assert!(grad_norm > 1e-8, "proxy_anchor grads should be non-zero");
+    }
+
+    #[test]
+    fn test_proxy_anchor_gradient_numerical() {
+        let embeddings: Vec<Vec<f32>> = vec![vec![0.7, 0.3, -0.2], vec![-0.3, 0.8, 0.1]];
+        let proxies: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let labels = [0, 1];
+        let margin = 0.1;
+        let alpha = 16.0;
+
+        let e_refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
+        let p_refs: Vec<&[f32]> = proxies.iter().map(|p| p.as_slice()).collect();
+        let out = proxy_anchor_loss(&e_refs, &labels, &p_refs, margin, alpha);
+
+        let eps = 1e-4;
+        let tol = 5e-2;
+
+        for i in 0..embeddings.len() {
+            for d in 0..3 {
+                let mut e_plus = embeddings.clone();
+                let mut e_minus = embeddings.clone();
+                e_plus[i][d] += eps;
+                e_minus[i][d] -= eps;
+
+                let ep: Vec<&[f32]> = e_plus.iter().map(|e| e.as_slice()).collect();
+                let em: Vec<&[f32]> = e_minus.iter().map(|e| e.as_slice()).collect();
+                let numerical = (proxy_anchor_loss(&ep, &labels, &p_refs, margin, alpha).loss
+                    - proxy_anchor_loss(&em, &labels, &p_refs, margin, alpha).loss)
+                    / (2.0 * eps);
+                let err = (out.grad_anchors[i][d] - numerical).abs();
+                let den = numerical.abs().max(out.grad_anchors[i][d].abs()).max(1e-6);
+                assert!(
+                    err / den < tol || err < tol * 0.1,
+                    "proxy_anchor emb[{i}][{d}]: analytical={}, numerical={numerical}",
+                    out.grad_anchors[i][d]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cross_batch_memory() {
+        let mut mem = CrossBatchMemory::new(4, 2);
+        assert!(mem.is_empty());
+
+        let e0: &[f32] = &[1.0, 0.0];
+        let e1: &[f32] = &[0.0, 1.0];
+        mem.enqueue(&[e0, e1], &[0, 1]);
+        assert_eq!(mem.len(), 2);
+
+        let e2: &[f32] = &[0.5, 0.5];
+        let e3: &[f32] = &[-1.0, 0.0];
+        mem.enqueue(&[e2, e3], &[0, 1]);
+        assert_eq!(mem.len(), 4);
+
+        // Enqueue one more, should evict oldest
+        let e4: &[f32] = &[0.3, 0.7];
+        mem.enqueue(&[e4], &[2]);
+        assert_eq!(mem.len(), 4);
+        assert_eq!(mem.memory_labels(), &[1, 0, 1, 2]);
+
+        // Use memory as negatives for a loss
+        let anchor: &[f32] = &[1.0, 0.0];
+        let positive: &[f32] = &[0.9, 0.1];
+        let neg_refs = mem.embeddings();
+        let out = mnrl_loss(&[anchor], &[positive], &neg_refs, 0.1);
+        assert!(
+            out.loss.is_finite(),
+            "loss with memory negatives: {}",
+            out.loss
+        );
     }
 }

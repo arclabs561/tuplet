@@ -503,6 +503,127 @@ pub fn vicreg_loss(
     Ok(total)
 }
 
+/// Proxy-Anchor Loss (Kim et al. 2020).
+///
+/// `embeddings`: `[batch, dim]`, `labels`: `[batch]` u32, `proxies`: `[num_classes, dim]`.
+pub fn proxy_anchor_loss(
+    embeddings: &Tensor,
+    labels: &Tensor,
+    proxies: &Tensor,
+    margin: f32,
+    alpha: f32,
+) -> Result<Tensor> {
+    let n = embeddings.dim(0)?;
+    let num_classes = proxies.dim(0)?;
+    let device = embeddings.device();
+
+    // L2-normalize
+    let norm_e = embeddings
+        .sqr()?
+        .sum(1)?
+        .sqrt()?
+        .clamp(1e-8, f32::MAX as f64)?;
+    let e_normed = embeddings.broadcast_div(&norm_e.unsqueeze(1)?)?;
+    let norm_p = proxies
+        .sqr()?
+        .sum(1)?
+        .sqrt()?
+        .clamp(1e-8, f32::MAX as f64)?;
+    let p_normed = proxies.broadcast_div(&norm_p.unsqueeze(1)?)?;
+
+    // Cosine similarity: [num_classes, batch]
+    let sims = p_normed.matmul(&e_normed.t()?)?;
+
+    // Build class masks: [num_classes, batch]
+    let labels_expanded = labels
+        .to_dtype(candle_core::DType::U32)?
+        .unsqueeze(0)?
+        .expand(&[num_classes, n])?;
+    let class_indices = Tensor::arange(0u32, num_classes as u32, device)?
+        .unsqueeze(1)?
+        .expand(&[num_classes, n])?;
+    let pos_mask = class_indices
+        .eq(&labels_expanded)?
+        .to_dtype(candle_core::DType::F32)?;
+    let neg_mask = pos_mask.affine(-1.0, 1.0)?;
+
+    // Positive term per proxy: softplus(-alpha * lse(alpha * (s - margin)) over pos)
+    let pos_logits = sims.affine(alpha as f64, -(alpha as f64 * margin as f64))?;
+    let masked_pos = pos_logits.broadcast_add(
+        &neg_mask.affine(-1e9, 0.0)?, // mask negatives to -inf
+    )?;
+    let lse_pos = log_sum_exp(&masked_pos, 1)?;
+    let sp_pos = lse_pos
+        .neg()?
+        .relu()?
+        .add(&lse_pos.abs()?.neg()?.exp()?.affine(1.0, 1.0)?.log()?)?;
+
+    // Negative term per proxy: softplus(alpha * lse(alpha * (s + margin)) over neg)
+    let neg_logits = sims.affine(alpha as f64, alpha as f64 * margin as f64)?;
+    let masked_neg = neg_logits.broadcast_add(
+        &pos_mask.affine(-1e9, 0.0)?, // mask positives to -inf
+    )?;
+    let lse_neg = log_sum_exp(&masked_neg, 1)?;
+    let sp_neg = lse_neg
+        .relu()?
+        .add(&lse_neg.abs()?.neg()?.exp()?.affine(1.0, 1.0)?.log()?)?;
+
+    sp_pos.add(&sp_neg)?.mean_all()
+}
+
+/// Lifted Structured Loss (Song et al. 2016).
+///
+/// `embeddings`: `[n, dim]`, `labels`: `[n]` integer labels.
+pub fn lifted_structured_loss(embeddings: &Tensor, labels: &Tensor, margin: f32) -> Result<Tensor> {
+    let n = embeddings.dim(0)?;
+    let device = embeddings.device();
+
+    // Pairwise Euclidean distances
+    let diff = embeddings
+        .unsqueeze(1)?
+        .broadcast_sub(&embeddings.unsqueeze(0)?)?;
+    let dists = diff.sqr()?.sum(2)?.sqrt()?;
+
+    // Masks
+    let labels_col = labels.unsqueeze(1)?.expand(&[n, n])?;
+    let labels_row = labels.unsqueeze(0)?.expand(&[n, n])?;
+    let pos_mask = labels_col
+        .eq(&labels_row)?
+        .to_dtype(candle_core::DType::F32)?;
+    let eye = Tensor::eye(n, candle_core::DType::F32, device)?;
+    let pos_mask_no_diag = pos_mask.mul(&eye.affine(-1.0, 1.0)?)?;
+    // For each positive pair (i,j): J = lse(margin - d_ik for neg k of i) + lse(margin - d_jl for neg l of j) + d_ij
+    // loss = 0.5 * mean(max(0, J)^2) over positive pairs
+
+    // margin - dists, masked for negatives (positives and self -> -inf)
+    let neg_terms = dists.affine(-1.0, margin as f64)?;
+    let masked_neg = neg_terms
+        .broadcast_add(&pos_mask.affine(-1e9, 0.0)?)?
+        .broadcast_add(&eye.affine(-1e9, 0.0)?)?;
+    let lse_per_anchor = log_sum_exp(&masked_neg, 1)?;
+
+    // For each positive pair (i,j): J_ij = lse_i + lse_j + d_ij
+    let j_matrix = lse_per_anchor
+        .unsqueeze(1)?
+        .broadcast_add(&lse_per_anchor.unsqueeze(0)?)?
+        .add(&dists)?;
+
+    // Mask to positive pairs only (upper triangle to avoid double counting)
+    let mut upper_data = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            upper_data[i * n + j] = 1.0;
+        }
+    }
+    let upper_mask = Tensor::from_slice(&upper_data, &[n, n], device)?;
+    let pair_mask = pos_mask_no_diag.mul(&upper_mask)?;
+
+    // 0.5 * mean(relu(J)^2) over positive pairs
+    let j_active = j_matrix.relu()?.sqr()?.mul(&pair_mask)?;
+    let n_pairs = pair_mask.sum_all()?.clamp(1.0, f64::MAX)?;
+    j_active.sum_all()?.div(&n_pairs)?.affine(0.5, 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +937,37 @@ mod tests {
 
         let loss = vicreg_loss(var.as_tensor(), &b, 25.0, 25.0, 1.0).unwrap();
         check_backward("vicreg", &loss, &var);
+    }
+
+    #[test]
+    fn test_proxy_anchor_basic() {
+        let emb = tensor(&[0.7, 0.3, 0.2, 0.8], &[2, 2]);
+        let proxies = tensor(&[1.0, 0.0, 0.0, 1.0, -1.0, 0.0], &[3, 2]);
+        let labels = Tensor::from_slice(&[0u32, 1], &[2], &Device::Cpu).unwrap();
+
+        let loss = proxy_anchor_loss(&emb, &labels, &proxies, 0.1, 32.0).unwrap();
+        let val = loss.to_scalar::<f32>().unwrap();
+        assert!(val.is_finite(), "proxy_anchor loss: {val}");
+    }
+
+    #[test]
+    fn test_proxy_anchor_backward() {
+        let var =
+            candle_core::Var::from_slice(&[0.7f32, 0.3, 0.2, 0.8], &[2, 2], &Device::Cpu).unwrap();
+        let proxies = tensor(&[1.0, 0.0, 0.0, 1.0, -1.0, 0.0], &[3, 2]);
+        let labels = Tensor::from_slice(&[0u32, 1], &[2], &Device::Cpu).unwrap();
+
+        let loss = proxy_anchor_loss(var.as_tensor(), &labels, &proxies, 0.1, 32.0).unwrap();
+        check_backward("proxy_anchor", &loss, &var);
+    }
+
+    #[test]
+    fn test_lifted_structured_basic() {
+        let emb = tensor(&[1.0, 0.5, 0.9, 0.6, 0.0, 1.0, 0.1, 0.9], &[4, 2]);
+        let labels = Tensor::from_slice(&[0u32, 0, 1, 1], &[4], &Device::Cpu).unwrap();
+
+        let loss = lifted_structured_loss(&emb, &labels, 1.0).unwrap();
+        let val = loss.to_scalar::<f32>().unwrap();
+        assert!(val >= 0.0 && val.is_finite(), "lifted loss: {val}");
     }
 }
