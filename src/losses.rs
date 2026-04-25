@@ -1669,7 +1669,7 @@ pub fn proxy_anchor_loss(
 /// Cross-batch memory buffer for expanding the negative pool.
 ///
 /// Maintains a FIFO queue of past embeddings. Call [`enqueue`](CrossBatchMemory::enqueue)
-/// after each batch to add the current batch's embeddings. Use [`negatives`](CrossBatchMemory::negatives)
+/// after each batch to add the current batch's embeddings. Use [`embeddings`](CrossBatchMemory::embeddings)
 /// to get the full memory bank as negative candidates for any pair-based loss.
 #[derive(Debug, Clone)]
 pub struct CrossBatchMemory {
