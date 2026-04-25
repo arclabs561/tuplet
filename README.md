@@ -1,114 +1,111 @@
-# mahala
+# tuplet
 
-Metric learning losses with analytical gradients.
+Tuple-based metric learning on Burn tensors.
 
-Contrastive, proxy-based, and self-supervised losses for embedding training.
-Two backends: pure-Rust `f32` slices with hand-derived gradients, and
-[candle](https://github.com/huggingface/candle) tensors with autograd.
+Contrastive, proxy, and self-supervised losses operate on pairs, triplets, and
+n-tuples of embeddings. Hard-negative mining and classical Mahalanobis distance
+learning (NCA, LMNN, ITML, KISSME) are pure Rust and need no autograd backend.
 
 ## Install
 
 ```toml
 [dependencies]
-mahala = "0.1"
+tuplet = "0.1"
 
-# Optional: SIMD-accelerated similarity via innr
-mahala = { version = "0.1", features = ["simd"] }
+# CPU training (default Burn backend):
+tuplet = { version = "0.1", features = ["burn-ndarray"] }
 
-# Optional: candle tensor losses with autograd
-mahala = { version = "0.1", features = ["candle"] }
+# WGPU / Metal / Vulkan / WebGPU:
+tuplet = { version = "0.1", default-features = false, features = ["mining", "burn-wgpu"] }
+
+# libtorch:
+tuplet = { version = "0.1", default-features = false, features = ["mining", "burn-tch"] }
+
+# CUDA (extends burn-ndarray):
+tuplet = { version = "0.1", features = ["burn-cuda"] }
 ```
+
+Pick exactly one `burn-*` backend per binary. The autograd backend is wired
+through the chosen Burn backend; you don't need to enable `burn-autodiff`
+yourself.
 
 ## Losses
 
-| Loss | f32 | candle | Reference |
-|------|-----|--------|-----------|
-| Triplet | `triplet_loss` | `candle_losses::triplet_loss` | Schroff et al. 2015 |
-| InfoNCE / NT-Xent | `infonce_loss` | `candle_losses::infonce_loss` | Oord et al. 2018 |
-| MNRL | `mnrl_loss` | `candle_losses::mnrl_loss` | Henderson et al. 2017 |
-| Contrastive | `contrastive_loss` | `candle_losses::contrastive_loss` | Hadsell et al. 2006 |
-| Cosine embedding | `cosine_embedding_loss` | `candle_losses::cosine_embedding_loss` | |
-| Multi-Similarity | `multi_similarity_loss` | `candle_losses::multi_similarity_loss` | Wang et al. 2019 |
-| SupCon | `supcon_loss` | `candle_losses::supcon_loss` | Khosla et al. 2020 |
-| Circle | `circle_loss` | `candle_losses::circle_loss` | Sun et al. 2020 |
-| Lifted Structured | `lifted_structured_loss` | `candle_losses::lifted_structured_loss` | Song et al. 2016 |
-| N-Pairs | `n_pairs_loss` | `candle_losses::n_pairs_loss` | Sohn 2016 |
-| ArcFace | `arcface_loss` | `candle_losses::arcface_loss` | Deng et al. 2019 |
-| ProxyAnchor | `proxy_anchor_loss` | `candle_losses::proxy_anchor_loss` | Kim et al. 2020 |
-| VICReg | `vicreg_loss` | `candle_losses::vicreg_loss` | Bardes et al. 2022 |
-| Matryoshka (wrapper) | `matryoshka_loss` | `candle_losses::matryoshka_loss` | Kusupati et al. 2022 |
+All losses operate on `Tensor<B: AutodiffBackend, _>` and return a scalar
+loss tensor you can call `.backward()` on.
 
-Plus: `CrossBatchMemory` for expanding the negative pool across batches.
+| Loss | Function | Reference |
+|------|----------|-----------|
+| Triplet | `triplet_loss` | Schroff et al. 2015 |
+| Contrastive | `contrastive_loss` | Hadsell et al. 2006 |
+| InfoNCE / NT-Xent | `infonce_loss` | Oord et al. 2018 |
+| MNRL | `mnrl_loss` | Henderson et al. 2017 |
+| N-Pairs | `n_pairs_loss` | Sohn 2016 |
+| Cosine embedding | `cosine_embedding_loss` | |
+| SupCon | `supcon_loss` | Khosla et al. 2020 |
+| Multi-Similarity | `multi_similarity_loss` | Wang et al. 2019 |
+| Circle | `circle_loss` | Sun et al. 2020 |
+| Lifted Structured | `lifted_structured_loss` | Song et al. 2016 |
+| ArcFace | `arcface_loss` | Deng et al. 2019 |
+| ProxyAnchor | `proxy_anchor_loss` | Kim et al. 2020 |
+| VICReg | `vicreg_loss` | Bardes et al. 2022 |
+| Matryoshka (wrapper) | `matryoshka_loss` | Kusupati et al. 2022 |
+
+`CrossBatchMemory` expands the negative pool across batches.
 
 ## Distance learning
 
-Classical Mahalanobis distance learning: `learn_transform`, `nca`, `lmnn`, `itml`, `kissme`.
+`learn_transform`, `nca`, `lmnn`, `itml`, `kissme` — closed-form / first-order
+solvers on `&[f32]` slices. No autograd, no Burn dependency.
 
 ## Negative miners
 
-`HardestMiner`, `SemiHardMiner`, `RandomMiner`, `InBatchMiner`, `MultiSimilarityMiner`, `DistanceWeightedMiner`.
+`HardestMiner`, `SemiHardMiner`, `RandomMiner`, `InBatchMiner`,
+`MultiSimilarityMiner`, `DistanceWeightedMiner`. Operate on similarity matrices.
+
+## Axiom utilities
+
+`axioms::triangle_violation` measures the worst triangle-inequality gap of a
+distance function over a sample. `bounds::ConvexProjector` clamps a distance
+matrix to the metric cone via Floyd-Warshall-style triangle propagation.
+Useful for sanity-checking learned metrics.
 
 ## Usage
 
-### Pure Rust (no framework)
-
 ```rust
-use mahala::*;
+use burn::backend::{Autodiff, NdArray};
+use burn::tensor::Tensor;
+use tuplet::burn_losses;
 
-let anchors: Vec<&[f32]> = vec![&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0]];
-let positives: Vec<&[f32]> = vec![&[0.9, 0.1, 0.0], &[0.1, 0.9, 0.0]];
+type B = Autodiff<NdArray>;
+let device = Default::default();
 
-let out = infonce_loss(&anchors, &positives, 0.07);
-println!("loss: {}", out.loss);
+let anchors:   Tensor<B, 2> = Tensor::from_floats([[1.0, 0.0], [0.0, 1.0]], &device);
+let positives: Tensor<B, 2> = Tensor::from_floats([[0.9, 0.1], [0.1, 0.9]], &device);
+let negatives: Tensor<B, 2> = Tensor::from_floats([[0.0, 1.0], [1.0, 0.0]], &device);
 
-// Apply gradients manually
-for (emb, grad) in anchors.iter().zip(&out.grad_anchors) {
-    // emb[d] -= lr * grad[d]
-}
-```
-
-### Candle (autograd)
-
-```rust
-use mahala::candle_losses;
-use candle_core::{Tensor, Device};
-
-let a = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &Device::Cpu)?;
-let b = Tensor::new(&[[0.9f32, 0.1], [0.1, 0.9]], &Device::Cpu)?;
-
-let loss = candle_losses::infonce_loss(&a, &b, 0.07)?;
-let grads = loss.backward()?;
-```
-
-### Cross-batch memory
-
-```rust
-use mahala::*;
-
-let mut memory = CrossBatchMemory::new(1024, 128); // capacity, dim
-
-// Each training step:
-memory.enqueue(&batch_embeddings, &batch_labels);
-let negatives = memory.embeddings();
-let out = mnrl_loss(&anchors, &positives, &negatives, 0.07);
+let loss = burn_losses::triplet_loss(anchors, positives, negatives, 0.2);
+let grads = loss.backward();
 ```
 
 ## Features
 
 | Feature | What it adds |
 |---------|-------------|
-| `mining` (default) | Negative miners (`HardestMiner`, etc.) |
+| `mining` (default) | Negative miners |
+| `burn-ndarray` | Burn losses with `NdArray` autodiff backend (multi-core CPU) |
+| `burn-wgpu` | Burn losses on Metal / Vulkan / WebGPU |
+| `burn-tch` | Burn losses on libtorch |
+| `burn-cuda` | Burn losses on CUDA (extends `burn-ndarray`) |
 | `simd` | SIMD-accelerated similarity via [innr](https://crates.io/crates/innr) |
-| `candle` | Tensor-based losses with autograd via [candle-core](https://crates.io/crates/candle-core) |
-| `serde` | Serialize/deserialize config structs |
+| `serde` | Serialize / deserialize config structs |
 
 ## Examples
 
 ```sh
-cargo run --example metric_learning      # all methods overview
-cargo run --example embedding_training   # f32 training loop (NCA + InfoNCE)
+cargo run --example metric_learning      # classical methods overview
 cargo run --example mining_pipeline      # miners + losses end-to-end
-cargo run --features candle --example candle_training  # candle autograd training
+cargo run --features burn-ndarray --example burn_training  # Burn autograd training
 ```
 
 License: MIT OR Apache-2.0

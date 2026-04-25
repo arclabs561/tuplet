@@ -1,11 +1,17 @@
+//! Tuple-based metric learning: contrastive losses, hard-negative mining, and
+//! classical Mahalanobis distance learning. Autograd losses run on Burn tensors;
+//! similarity functions, classical learners, and miners are pure Rust.
+
+pub mod axioms;
+pub mod bounds;
 pub mod losses;
 pub mod mahalanobis;
 #[cfg(feature = "mining")]
 pub mod mining;
 pub mod similarity;
 
-#[cfg(feature = "candle")]
-pub mod candle_losses;
+#[cfg(feature = "_burn")]
+pub mod burn_losses;
 
 pub use losses::{
     CrossBatchMemory, DistanceFn, LossOutput, arcface_loss, circle_loss, contrastive_loss,

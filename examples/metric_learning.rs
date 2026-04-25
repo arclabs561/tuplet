@@ -5,7 +5,7 @@
 //!
 //! Run: `cargo run --example metric_learning`
 
-use mahala::*;
+use tuplet::*;
 
 fn main() {
     // Generate 3 overlapping 2D clusters

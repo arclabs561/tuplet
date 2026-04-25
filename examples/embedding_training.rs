@@ -5,7 +5,7 @@
 //!
 //! Run: `cargo run --example embedding_training`
 
-use mahala::*;
+use tuplet::*;
 
 fn main() {
     // 3 classes of 2D points, 5 samples each

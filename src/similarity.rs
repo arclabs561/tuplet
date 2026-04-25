@@ -28,11 +28,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         let norm_a = dot(a, a).sqrt();
         let norm_b = dot(b, b).sqrt();
         let denom = norm_a * norm_b;
-        if denom == 0.0 {
-            0.0
-        } else {
-            d / denom
-        }
+        if denom == 0.0 { 0.0 } else { d / denom }
     }
 }
 

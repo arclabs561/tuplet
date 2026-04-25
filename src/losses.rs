@@ -1,3 +1,10 @@
+//! Hand-derived gradient implementations of the metric-learning losses.
+//!
+//! **Transition status**: scheduled for deletion once every loss in this file
+//! has a Burn equivalent in `crate::burn_losses`. Don't add new losses here
+//! and don't depend on this surface for new code — write the Burn version.
+//! See `burn_losses` for the canonical implementations going forward.
+
 use crate::similarity::{
     accumulate_cosine_grad, accumulate_cosine_grad_pair, cosine_similarity,
     cosine_similarity_with_norms, dot, euclidean_distance,

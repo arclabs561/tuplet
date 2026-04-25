@@ -6,7 +6,7 @@
 //!
 //! Run: `cargo run --example mining_pipeline`
 
-use mahala::*;
+use tuplet::*;
 
 fn main() {
     // Pool of embeddings with class labels

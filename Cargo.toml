@@ -1,35 +1,50 @@
 [workspace]
 
 [package]
-name = "mahala"
+name = "tuplet"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Metric learning from Mahalanobis to InfoNCE: distance learning, contrastive losses, and hard negative mining"
+description = "Tuple-based metric learning: contrastive losses, hard-negative mining, and classical Mahalanobis methods on Burn tensors"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/arclabs561/mahala"
+repository = "https://github.com/arclabs561/tuplet"
 categories = ["science", "algorithms"]
 keywords = [
-  "mahalanobis",
   "metric-learning",
-  "contrastive-learning",
-  "triplet-loss",
+  "contrastive",
+  "triplet",
   "infonce",
+  "mahalanobis",
 ]
 
 [dependencies]
-candle-core = { version = "0.9", optional = true }
 innr = { version = "0.2", optional = true }
 rand = { version = "0.9", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
+burn = { version = "0.20", features = ["autodiff"], optional = true }
+burn-autodiff = { version = "0.20", optional = true }
+burn-ndarray = { version = "0.20", features = ["rayon"], optional = true }
+burn-wgpu = { version = "0.20", optional = true }
+burn-tch = { version = "0.20", optional = true }
+
 [features]
 default = ["mining"]
-candle = ["dep:candle-core"]
 mining = ["dep:rand"]
 serde = ["dep:serde"]
 simd = ["dep:innr"]
 
+# Private umbrella that the public burn-* features pull in; lets `burn_losses`
+# gate on a single `feature = "_burn"` instead of enumerating every backend.
+_burn = ["dep:burn", "dep:burn-autodiff"]
+
+# Burn backends. Pick one (and only one) when using the autograd loss API.
+# burn-ndarray is the safe CPU default; burn-wgpu/tch/cuda are for accelerated training.
+burn-ndarray = ["_burn", "dep:burn-ndarray"]
+burn-wgpu = ["_burn", "dep:burn-wgpu"]
+burn-tch = ["_burn", "dep:burn-tch"]
+burn-cuda = ["burn-ndarray", "burn/cuda"]
+
 [[example]]
-name = "candle_training"
-required-features = ["candle"]
+name = "burn_training"
+required-features = ["burn-ndarray"]
