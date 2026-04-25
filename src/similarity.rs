@@ -1,6 +1,6 @@
 /// Dot product of two vectors.
 ///
-/// When the `simd` feature is enabled, delegates to [`innr::dot`] for
+/// When the `simd` feature is enabled, delegates to `innr::dot` for
 /// hardware-accelerated computation (AVX-512, AVX2, NEON).
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "simd")]
@@ -16,7 +16,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Cosine similarity between two vectors.
 ///
-/// When the `simd` feature is enabled, delegates to [`innr::cosine`].
+/// When the `simd` feature is enabled, delegates to `innr::cosine`.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "simd")]
     {
@@ -28,13 +28,17 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         let norm_a = dot(a, a).sqrt();
         let norm_b = dot(b, b).sqrt();
         let denom = norm_a * norm_b;
-        if denom == 0.0 { 0.0 } else { d / denom }
+        if denom == 0.0 {
+            0.0
+        } else {
+            d / denom
+        }
     }
 }
 
 /// Euclidean distance between two vectors.
 ///
-/// When the `simd` feature is enabled, delegates to [`innr::l2_distance`].
+/// When the `simd` feature is enabled, delegates to `innr::l2_distance`.
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(feature = "simd")]
     {
