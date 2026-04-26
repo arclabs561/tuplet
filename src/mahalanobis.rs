@@ -24,12 +24,14 @@ pub fn mahalanobis_distance(a: &[f32], b: &[f32], m: &[f32]) -> f32 {
     result.max(0.0).sqrt()
 }
 
-// TODO(v0.2): switch to builder pattern + `#[non_exhaustive]` so adding fields
-// is not a breaking change. Currently exhaustive for ergonomic struct-literal
-// construction (`..Default::default()` is blocked under `#[non_exhaustive]`).
 /// Configuration for Mahalanobis distance learning.
+///
+/// Construct with [`MahalanobisConfig::new`] or [`MahalanobisConfig::default`]
+/// and mutate the public fields. Marked `#[non_exhaustive]` so adding fields in
+/// future versions does not require a major bump.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct MahalanobisConfig {
     /// Learning rate.
     pub lr: f32,
@@ -39,6 +41,15 @@ pub struct MahalanobisConfig {
     pub tol: f32,
     /// Margin for dissimilar pairs.
     pub margin: f32,
+}
+
+impl MahalanobisConfig {
+    /// Returns the default configuration. Equivalent to `Default::default()`,
+    /// provided so downstream code can construct instances without struct
+    /// literals (which `#[non_exhaustive]` forbids across crate boundaries).
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl Default for MahalanobisConfig {
@@ -153,6 +164,7 @@ pub fn learn_mahalanobis(
 /// Configuration for Neighbourhood Components Analysis.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct NcaConfig {
     /// Learning rate.
     pub lr: f32,
@@ -160,6 +172,13 @@ pub struct NcaConfig {
     pub max_iter: usize,
     /// Convergence tolerance on objective change.
     pub tol: f32,
+}
+
+impl NcaConfig {
+    /// Returns the default configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl Default for NcaConfig {
@@ -305,6 +324,7 @@ pub fn nca(data: &[&[f32]], labels: &[usize], out_dim: usize, config: &NcaConfig
 /// Configuration for Large Margin Nearest Neighbor.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct LmnnConfig {
     /// Learning rate.
     pub lr: f32,
@@ -318,6 +338,13 @@ pub struct LmnnConfig {
     pub margin: f32,
     /// Weight balancing pull vs push terms. `loss = (1-mu)*pull + mu*push`.
     pub mu: f32,
+}
+
+impl LmnnConfig {
+    /// Returns the default configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl Default for LmnnConfig {
@@ -483,6 +510,7 @@ pub fn transform_batch(
 /// Configuration for Information-Theoretic Metric Learning.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct ItmlConfig {
     /// Maximum number of Bregman projection iterations.
     pub max_iter: usize,
@@ -490,6 +518,13 @@ pub struct ItmlConfig {
     pub tol: f32,
     /// Slack parameter controlling how strictly constraints are enforced.
     pub gamma: f32,
+}
+
+impl ItmlConfig {
+    /// Returns the default configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl Default for ItmlConfig {

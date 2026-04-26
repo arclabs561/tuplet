@@ -30,11 +30,8 @@ fn main() {
     let data_refs: Vec<&[f32]> = data.iter().map(|p| p.as_slice()).collect();
 
     println!("=== Phase 1: NCA projection ===\n");
-    let nca_config = NcaConfig {
-        lr: 0.01,
-        max_iter: 200,
-        tol: 1e-8,
-    };
+    let mut nca_config = NcaConfig::new();
+    nca_config.tol = 1e-8;
     let l = nca(&data_refs, &labels, 2, &nca_config);
     let projected: Vec<Vec<f32>> = data_refs.iter().map(|p| transform(p, &l, 2, 2)).collect();
     let proj_refs: Vec<&[f32]> = projected.iter().map(|v| v.as_slice()).collect();

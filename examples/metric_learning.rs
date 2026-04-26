@@ -37,12 +37,9 @@ fn main() {
 
     // 1. Mahalanobis distance learning
     let (similar, dissimilar) = build_pairs(&data_refs, &labels);
-    let m_config = MahalanobisConfig {
-        lr: 0.05,
-        max_iter: 200,
-        tol: 1e-8,
-        margin: 1.0,
-    };
+    let mut m_config = MahalanobisConfig::new();
+    m_config.lr = 0.05;
+    m_config.tol = 1e-8;
     let l_maha = learn_transform(&similar, &dissimilar, 2, 2, &m_config);
     let transformed: Vec<Vec<f32>> = data_refs
         .iter()
@@ -55,11 +52,8 @@ fn main() {
     );
 
     // 2. NCA
-    let nca_config = NcaConfig {
-        lr: 0.01,
-        max_iter: 200,
-        tol: 1e-8,
-    };
+    let mut nca_config = NcaConfig::new();
+    nca_config.tol = 1e-8;
     let l_nca = nca(&data_refs, &labels, 2, &nca_config);
     let transformed: Vec<Vec<f32>> = data_refs
         .iter()
@@ -72,14 +66,9 @@ fn main() {
     );
 
     // 3. LMNN
-    let lmnn_config = LmnnConfig {
-        lr: 0.01,
-        max_iter: 200,
-        tol: 1e-8,
-        k: 2,
-        margin: 1.0,
-        mu: 0.5,
-    };
+    let mut lmnn_config = LmnnConfig::new();
+    lmnn_config.tol = 1e-8;
+    lmnn_config.k = 2;
     let l_lmnn = lmnn(&data_refs, &labels, 2, &lmnn_config);
     let transformed: Vec<Vec<f32>> = data_refs
         .iter()
@@ -99,11 +88,8 @@ fn main() {
     );
 
     // 5. ITML
-    let itml_config = ItmlConfig {
-        max_iter: 200,
-        tol: 1e-6,
-        gamma: 1.0,
-    };
+    let mut itml_config = ItmlConfig::new();
+    itml_config.max_iter = 200;
     let m_itml = itml(&similar, &dissimilar, 2, &itml_config);
     println!(
         "ITML:                      (M computed, trace={:.4})",
