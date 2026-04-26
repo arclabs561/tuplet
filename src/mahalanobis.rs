@@ -24,6 +24,9 @@ pub fn mahalanobis_distance(a: &[f32], b: &[f32], m: &[f32]) -> f32 {
     result.max(0.0).sqrt()
 }
 
+// TODO(v0.2): switch to builder pattern + `#[non_exhaustive]` so adding fields
+// is not a breaking change. Currently exhaustive for ergonomic struct-literal
+// construction (`..Default::default()` is blocked under `#[non_exhaustive]`).
 /// Configuration for Mahalanobis distance learning.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -350,7 +353,7 @@ pub fn lmnn(data: &[&[f32]], labels: &[usize], out_dim: usize, config: &LmnnConf
                 .filter(|&j| j != i && labels[j] == labels[i])
                 .map(|j| (j, euclidean_distance(data[i], data[j])))
                 .collect();
-            same_class.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            same_class.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             same_class
                 .iter()
                 .take(config.k)

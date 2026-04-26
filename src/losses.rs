@@ -36,6 +36,7 @@ pub struct LossOutput {
 
 /// Distance function selector for triplet loss.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum DistanceFn {
     /// Euclidean (L2) distance.
     Euclidean,

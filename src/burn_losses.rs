@@ -18,6 +18,14 @@
 
 use burn::tensor::{Int, Tensor, backend::AutodiffBackend};
 
+// Re-export the Burn types that appear in this module's public API. Per
+// Effective Rust Item 24, a major-version bump of `burn` is a breaking change
+// of this crate's public surface; re-exporting lets downstream code import the
+// matching version through `tuplet::burn_losses::{Tensor, AutodiffBackend, Int}`
+// instead of pinning `burn` independently and risking a type-mismatch error
+// with no obvious cause.
+pub use burn::tensor::{Int as BurnInt, Tensor as BurnTensor, backend::AutodiffBackend as Backend};
+
 /// L2-normalize each row to unit length. Used by similarity-based losses.
 fn l2_normalize<B: AutodiffBackend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
     let norm = x.clone().powf_scalar(2.0).sum_dim(1).sqrt();
