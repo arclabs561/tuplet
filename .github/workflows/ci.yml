@@ -1,14 +1,11 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -19,14 +16,11 @@ jobs:
           - name: default
             features: ""
             toolchain: "1.85.0"
-          - name: candle
-            features: "--features candle"
-            toolchain: nightly
+          - name: burn-ndarray
+            features: "--no-default-features --features mining,burn-ndarray"
+            toolchain: stable
           - name: simd
             features: "--features simd"
-            toolchain: nightly
-          - name: all
-            features: "--all-features"
             toolchain: nightly
     name: test (${{ matrix.name }})
     steps:
@@ -35,22 +29,19 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
-
       - name: Build
         run: cargo build ${{ matrix.features }}
-
       - name: Test
         run: cargo test ${{ matrix.features }}
-
-      - name: Examples
+      - name: Run examples (default)
+        if: matrix.name == 'default'
         run: |
           cargo run --example metric_learning
           cargo run --example embedding_training
           cargo run --example mining_pipeline
-          if [ "${{ matrix.name }}" = "candle" ] || [ "${{ matrix.name }}" = "all" ]; then
-            cargo run --features candle --example candle_training
-          fi
-
+      - name: Run examples (burn-ndarray)
+        if: matrix.name == 'burn-ndarray'
+        run: cargo run --no-default-features --features mining,burn-ndarray --example burn_training
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -59,12 +50,22 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-
       - name: Format
         run: cargo fmt -- --check
-
-      - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Doc
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+      # Lint each backend separately. `--all-features` enables every burn-* backend
+      # at once and Burn does not tolerate multiple backends in one binary.
+      - name: Clippy (default)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (burn-ndarray)
+        run: cargo clippy --all-targets --no-default-features --features mining,burn-ndarray -- -D warnings
+      - name: Doc (burn-ndarray)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features mining,burn-ndarray
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: only-explicit-features
+          features: mining,burn-ndarray
