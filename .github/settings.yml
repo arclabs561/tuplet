@@ -1,9 +1,8 @@
 # Managed by repository-settings/app
 # https://github.com/repository-settings/app
-
 repository:
-  description: "Metric learning losses with analytical gradients"
-  homepage: "https://docs.rs/mahala"
+  description: "Tuple-based metric learning on Burn tensors"
+  homepage: "https://docs.rs/tuplet"
   private: false
   has_issues: true
   has_wiki: false
@@ -13,10 +12,11 @@ repository:
   allow_merge_commit: true
   allow_rebase_merge: true
   delete_branch_on_merge: true
-
   topics:
     - metric-learning
-    - contrastive-learning
-    - mahalanobis
-    - triplet-loss
+    - contrastive
+    - triplet
     - infonce
+    - mahalanobis
+    - burn
+    - rust
