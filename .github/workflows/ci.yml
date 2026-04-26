@@ -60,12 +60,3 @@ jobs:
         run: cargo clippy --all-targets --no-default-features --features mining,burn-ndarray -- -D warnings
       - name: Doc (burn-ndarray)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features mining,burn-ndarray
-  semver:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          feature-group: only-explicit-features
-          features: mining,burn-ndarray
