@@ -10,19 +10,19 @@ learning (NCA, LMNN, ITML, KISSME) are pure Rust and need no autograd backend.
 
 ```toml
 [dependencies]
-tuplet = "0.1"
+tuplet = "0.2"
 
 # CPU training (default Burn backend):
-tuplet = { version = "0.1", features = ["burn-ndarray"] }
+tuplet = { version = "0.2", features = ["burn-ndarray"] }
 
 # WGPU / Metal / Vulkan / WebGPU:
-tuplet = { version = "0.1", default-features = false, features = ["mining", "burn-wgpu"] }
+tuplet = { version = "0.2", default-features = false, features = ["mining", "burn-wgpu"] }
 
 # libtorch:
-tuplet = { version = "0.1", default-features = false, features = ["mining", "burn-tch"] }
+tuplet = { version = "0.2", default-features = false, features = ["mining", "burn-tch"] }
 
 # CUDA (extends burn-ndarray):
-tuplet = { version = "0.1", features = ["burn-cuda"] }
+tuplet = { version = "0.2", features = ["burn-cuda"] }
 ```
 
 Pick exactly one `burn-*` backend per binary. The autograd backend is wired
