@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+# Real datasets fetched by scripts/fetch_*.sh (examples only)
+/data/
