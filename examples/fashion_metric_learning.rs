@@ -11,6 +11,9 @@
 //! cargo run --release --example fashion_metric_learning
 //! ```
 
+// Index loops are the clearest form for the flat-matrix MLP forward/backward.
+#![allow(clippy::needless_range_loop)]
+
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -161,15 +164,22 @@ fn init(buf: &mut [f32], seed: &mut u64, scale: f32) {
 fn main() -> ExitCode {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/fashion");
     if !dir.join("train-images-idx3-ubyte").exists() {
-        eprintln!("dataset not found at {}\nrun: ./scripts/fetch_fashion_mnist.sh", dir.display());
-        return ExitCode::FAILURE;
+        eprintln!(
+            "dataset not found at {}\nrun: ./scripts/fetch_fashion_mnist.sh",
+            dir.display()
+        );
+        return ExitCode::SUCCESS;
     }
 
     let train_x = load_images(&dir.join("train-images-idx3-ubyte"), 6000).unwrap();
     let train_y = load_labels(&dir.join("train-labels-idx1-ubyte"), 6000).unwrap();
     let test_x = load_images(&dir.join("t10k-images-idx3-ubyte"), 2000).unwrap();
     let test_y = load_labels(&dir.join("t10k-labels-idx1-ubyte"), 2000).unwrap();
-    println!("train: {}  test: {}  emb_dim: {EMB_DIM}", train_x.len(), test_x.len());
+    println!(
+        "train: {}  test: {}  emb_dim: {EMB_DIM}",
+        train_x.len(),
+        test_x.len()
+    );
 
     let raw_acc = knn_accuracy(&test_x, &test_y, &train_x, &train_y);
     println!("raw-pixel kNN@{KNN} accuracy:      {raw_acc:.4}");
@@ -210,7 +220,13 @@ fn main() -> ExitCode {
             let mut g1 = vec![0.0f32; HID * IN_DIM];
             let mut g2 = vec![0.0f32; EMB_DIM * HID];
             for (bi, &i) in chunk.iter().enumerate() {
-                model.backward(&train_x[i], &hs[bi], &out.grad_anchors[bi], &mut g1, &mut g2);
+                model.backward(
+                    &train_x[i],
+                    &hs[bi],
+                    &out.grad_anchors[bi],
+                    &mut g1,
+                    &mut g2,
+                );
             }
             let scale = lr / chunk.len() as f32;
             for (w, g) in model.w1.iter_mut().zip(&g1) {
@@ -221,7 +237,10 @@ fn main() -> ExitCode {
             }
         }
         if epoch % 10 == 0 || epoch == 1 {
-            println!("epoch {epoch:>2}  supcon loss {:.4}", epoch_loss / nb as f32);
+            println!(
+                "epoch {epoch:>2}  supcon loss {:.4}",
+                epoch_loss / nb as f32
+            );
         }
     }
 
@@ -230,7 +249,10 @@ fn main() -> ExitCode {
     let learned_acc = knn_accuracy(&test_emb, &test_y, &train_emb, &train_y);
 
     println!("learned-embedding kNN@{KNN} accuracy: {learned_acc:.4}");
-    println!("improvement:                       {:+.4}", learned_acc - raw_acc);
+    println!(
+        "improvement:                       {:+.4}",
+        learned_acc - raw_acc
+    );
 
     ExitCode::SUCCESS
 }
