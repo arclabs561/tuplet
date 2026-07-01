@@ -55,7 +55,7 @@ loss tensor you can call `.backward()` on.
 
 ## Distance learning
 
-`learn_transform`, `nca`, `lmnn`, `itml`, `kissme` — closed-form / first-order
+`learn_transform`, `nca`, `lmnn`, `itml`, `kissme`: closed-form / first-order
 solvers on `&[f32]` slices. No autograd, no Burn dependency.
 
 ## Negative miners
@@ -102,10 +102,7 @@ let grads = loss.backward();
 
 ## Examples
 
-```sh
-cargo run --example metric_learning      # classical methods overview
-cargo run --example mining_pipeline      # miners + losses end-to-end
-cargo run --features burn-ndarray --example burn_training  # Burn autograd training
-```
+See [examples/README.md](examples/README.md) for runnable examples with
+captured output.
 
 License: MIT OR Apache-2.0
