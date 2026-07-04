@@ -21,7 +21,7 @@ jobs:
             toolchain: stable
           - name: simd
             features: "--features simd"
-            toolchain: nightly
+            toolchain: stable
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v6
@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
