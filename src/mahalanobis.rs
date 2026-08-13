@@ -825,86 +825,106 @@ fn invert_matrix(mat: &[f32], dim: usize) -> Vec<f32> {
 
 /// Clip negative eigenvalues of a symmetric matrix to zero.
 ///
-/// Uses power iteration to find eigenvectors, then reconstructs with clipped eigenvalues.
-/// For small dimensions this is practical; for large dims a proper eigendecomposition
-/// library would be needed.
+/// Uses cyclic Jacobi rotations, then reconstructs from the clipped spectrum.
 fn clip_negative_eigenvalues(m: &mut [f32], dim: usize) {
-    // Simple approach: use iterative eigendecomposition
-    // For small dims (typical in metric learning), we do sequential deflation.
+    assert_eq!(m.len(), dim * dim, "matrix must be dim x dim");
+    if dim == 0 {
+        return;
+    }
 
-    let mut eigenvalues = Vec::with_capacity(dim);
-    let mut eigenvectors = Vec::with_capacity(dim);
+    // Covariance inverses are symmetric in exact arithmetic. Symmetrize before
+    // diagonalization so roundoff in the inversion cannot bias one triangle.
+    let mut diagonal = vec![0.0f64; dim * dim];
+    for i in 0..dim {
+        for j in 0..dim {
+            diagonal[i * dim + j] = 0.5 * (f64::from(m[i * dim + j]) + f64::from(m[j * dim + i]));
+        }
+    }
 
-    let mut work = m.to_vec();
+    let mut eigenvectors = vec![0.0f64; dim * dim];
+    for i in 0..dim {
+        eigenvectors[i * dim + i] = 1.0;
+    }
 
-    for _ in 0..dim {
-        // Power iteration to find dominant eigenvalue/vector
-        let mut v = vec![1.0f32; dim];
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        for x in v.iter_mut() {
-            *x /= norm;
+    // A cyclic Jacobi sweep costs O(dim^3), avoids seed-dependent missing
+    // eigenspaces, and keeps the eigenvectors orthogonal without deflation.
+    let scale = diagonal
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    let tolerance = 32.0 * f64::EPSILON * dim as f64 * scale.max(f64::MIN_POSITIVE);
+    let max_sweeps = 64;
+
+    for _ in 0..max_sweeps {
+        let off_diagonal_norm = (0..dim)
+            .flat_map(|i| ((i + 1)..dim).map(move |j| (i, j)))
+            .map(|(i, j)| 2.0 * diagonal[i * dim + j].powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if off_diagonal_norm <= tolerance {
+            break;
         }
 
-        let mut eigenvalue = 0.0f32;
+        for p in 0..dim {
+            for q in (p + 1)..dim {
+                let apq = diagonal[p * dim + q];
+                if apq == 0.0 {
+                    continue;
+                }
 
-        for _iter in 0..200 {
-            // w = work * v
-            let mut w = vec![0.0f32; dim];
-            for i in 0..dim {
-                for j in 0..dim {
-                    w[i] += work[i * dim + j] * v[j];
+                let app = diagonal[p * dim + p];
+                let aqq = diagonal[q * dim + q];
+                let tau = (aqq - app) / (2.0 * apq);
+                let t = if tau >= 0.0 {
+                    1.0 / (tau + (1.0 + tau * tau).sqrt())
+                } else {
+                    -1.0 / (-tau + (1.0 + tau * tau).sqrt())
+                };
+                let cosine = 1.0 / (1.0 + t * t).sqrt();
+                let sine = t * cosine;
+
+                for k in 0..dim {
+                    if k == p || k == q {
+                        continue;
+                    }
+                    let akp = diagonal[k * dim + p];
+                    let akq = diagonal[k * dim + q];
+                    let new_kp = cosine * akp - sine * akq;
+                    let new_kq = sine * akp + cosine * akq;
+                    diagonal[k * dim + p] = new_kp;
+                    diagonal[p * dim + k] = new_kp;
+                    diagonal[k * dim + q] = new_kq;
+                    diagonal[q * dim + k] = new_kq;
+                }
+
+                diagonal[p * dim + p] = app - t * apq;
+                diagonal[q * dim + q] = aqq + t * apq;
+                diagonal[p * dim + q] = 0.0;
+                diagonal[q * dim + p] = 0.0;
+
+                for k in 0..dim {
+                    let vkp = eigenvectors[k * dim + p];
+                    let vkq = eigenvectors[k * dim + q];
+                    eigenvectors[k * dim + p] = cosine * vkp - sine * vkq;
+                    eigenvectors[k * dim + q] = sine * vkp + cosine * vkq;
                 }
             }
-
-            eigenvalue = w.iter().zip(v.iter()).map(|(&a, &b)| a * b).sum();
-
-            let norm: f32 = w.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm < 1e-10 {
-                eigenvalue = 0.0;
-                break;
-            }
-            for x in w.iter_mut() {
-                *x /= norm;
-            }
-
-            // Check convergence
-            let diff: f32 = w
-                .iter()
-                .zip(v.iter())
-                .map(|(&a, &b)| (a - b).powi(2))
-                .sum::<f32>();
-            v = w;
-            if diff < 1e-10 {
-                break;
-            }
-        }
-
-        eigenvalues.push(eigenvalue);
-        eigenvectors.push(v.clone());
-
-        // Deflate: work -= eigenvalue * v * v^T
-        for i in 0..dim {
-            for j in 0..dim {
-                work[i * dim + j] -= eigenvalue * v[i] * v[j];
-            }
         }
     }
 
-    // Reconstruct with clipped eigenvalues
-    for val in m.iter_mut() {
-        *val = 0.0;
-    }
-    for (k, &ev) in eigenvalues.iter().enumerate() {
-        let clipped = ev.max(0.0);
-        if clipped < 1e-10 {
-            continue;
-        }
-        let v = &eigenvectors[k];
+    let mut projected = vec![0.0f64; dim * dim];
+    for k in 0..dim {
+        let clipped = diagonal[k * dim + k].max(0.0);
         for i in 0..dim {
             for j in 0..dim {
-                m[i * dim + j] += clipped * v[i] * v[j];
+                projected[i * dim + j] +=
+                    clipped * eigenvectors[i * dim + k] * eigenvectors[j * dim + k];
             }
         }
+    }
+    for (output, projected) in m.iter_mut().zip(projected) {
+        *output = projected as f32;
     }
 }
 
@@ -912,6 +932,109 @@ fn clip_negative_eigenvalues(m: &mut [f32], dim: usize) {
 mod tests {
     use super::*;
     use crate::similarity::euclidean_distance;
+
+    fn assert_matrix_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "matrix entry {index}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn psd_projection_preserves_repeated_eigenspace() {
+        #[rustfmt::skip]
+        let mut matrix = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        let expected = matrix.clone();
+
+        clip_negative_eigenvalues(&mut matrix, 3);
+
+        assert_matrix_close(&matrix, &expected, 1e-6);
+    }
+
+    #[test]
+    fn psd_projection_clips_negative_diagonal_eigenvalue() {
+        let mut matrix = vec![2.0, 0.0, 0.0, -1.0];
+
+        clip_negative_eigenvalues(&mut matrix, 2);
+
+        assert_matrix_close(&matrix, &[2.0, 0.0, 0.0, 0.0], 1e-6);
+    }
+
+    #[test]
+    fn psd_projection_clips_rotated_negative_eigenvalue() {
+        let mut matrix = vec![0.0, 1.0, 1.0, 0.0];
+
+        clip_negative_eigenvalues(&mut matrix, 2);
+
+        assert_matrix_close(&matrix, &[0.5, 0.5, 0.5, 0.5], 1e-6);
+    }
+
+    #[test]
+    fn psd_projection_symmetrizes_roundoff_before_clipping() {
+        let mut matrix = vec![1.0, 3.0, 1.0, 1.0];
+
+        clip_negative_eigenvalues(&mut matrix, 2);
+
+        assert_matrix_close(&matrix, &[1.5, 1.5, 1.5, 1.5], 1e-6);
+    }
+
+    #[test]
+    fn psd_projection_is_symmetric_positive_and_idempotent() {
+        #[rustfmt::skip]
+        let mut matrix = vec![
+             2.0,  1.5, -0.5,  0.2,
+             1.5, -1.0,  0.7, -0.3,
+            -0.5,  0.7,  0.5,  1.1,
+             0.2, -0.3,  1.1, -2.0,
+        ];
+        clip_negative_eigenvalues(&mut matrix, 4);
+
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!((matrix[i * 4 + j] - matrix[j * 4 + i]).abs() <= 1e-6);
+            }
+        }
+
+        for mask in 1..81 {
+            let mut encoded = mask;
+            let mut vector = [0.0f32; 4];
+            for value in &mut vector {
+                *value = (encoded % 3) as f32 - 1.0;
+                encoded /= 3;
+            }
+            let quadratic_form: f32 = (0..4)
+                .map(|i| {
+                    (0..4)
+                        .map(|j| vector[i] * matrix[i * 4 + j] * vector[j])
+                        .sum::<f32>()
+                })
+                .sum();
+            assert!(
+                quadratic_form >= -1e-5,
+                "projected matrix has negative quadratic form {quadratic_form} for {vector:?}"
+            );
+        }
+
+        let projected = matrix.clone();
+        clip_negative_eigenvalues(&mut matrix, 4);
+        assert_matrix_close(&matrix, &projected, 1e-5);
+    }
+
+    #[test]
+    fn psd_projection_handles_zero_matrix() {
+        let mut matrix = vec![0.0; 9];
+
+        clip_negative_eigenvalues(&mut matrix, 3);
+
+        assert_eq!(matrix, vec![0.0; 9]);
+    }
 
     #[test]
     fn test_mahalanobis_identity() {
