@@ -1,6 +1,6 @@
 # tuplet
 
-Tuple-based metric learning on Burn tensors.
+Tuple-based metric learning utilities, with selected losses on Burn tensors.
 
 Contrastive, proxy, and self-supervised losses operate on pairs, triplets, and
 n-tuples of embeddings. Hard-negative mining and classical Mahalanobis distance
@@ -31,8 +31,9 @@ yourself.
 
 ## Losses
 
-All losses operate on `Tensor<B: AutodiffBackend, _>` and return a scalar
-loss tensor you can call `.backward()` on.
+The Burn implementations of triplet, contrastive, and InfoNCE losses operate on
+`Tensor<B: AutodiffBackend, _>` and return a scalar tensor for `.backward()`.
+The other losses in this table use the pure-Rust slice API.
 
 | Loss | Function | Reference |
 |------|----------|-----------|
@@ -66,9 +67,8 @@ solvers on `&[f32]` slices. No autograd, no Burn dependency.
 ## Axiom utilities
 
 `axioms::triangle_violation` measures the worst triangle-inequality gap of a
-distance function over a sample. `bounds::ConvexProjector` clamps a distance
-matrix to the metric cone via Floyd-Warshall-style triangle propagation.
-Useful for sanity-checking learned metrics.
+distance function over a sample. It is useful for sanity-checking learned
+metrics.
 
 ## Usage
 

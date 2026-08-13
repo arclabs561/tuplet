@@ -1,7 +1,7 @@
 # Managed by repository-settings/app
 # https://github.com/repository-settings/app
 repository:
-  description: "Tuple-based metric learning on Burn tensors"
+  description: "Tuple-based metric learning utilities"
   homepage: "https://docs.rs/tuplet"
   private: false
   has_issues: true
