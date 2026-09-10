@@ -4,26 +4,14 @@
 //! scalar loss tensor on which `.backward()` can be called. Embeddings are
 //! `[batch, dim]`; labels are `[batch]` of `Int`.
 //!
-//! Backend selection is per-binary: pick exactly one of `burn-ndarray`,
-//! `burn-wgpu`, `burn-tch`, or `burn-cuda` in your `Cargo.toml` features.
-//! The same loss code runs on all of them.
-//!
-//! ## Status
-//!
-//! Implemented: `triplet_loss`, `contrastive_loss`, `infonce_loss`.
-//! The remaining 13 losses (multi_similarity, supcon, circle, lifted_structured,
-//! n_pairs, cosine_embedding, mnrl, arcface, vicreg, proxy_anchor, matryoshka,
-//! and CrossBatchMemory) are being ported from the previous candle backend in
-//! follow-up commits.
+//! Enable the `burn-*` feature for the backend used by the calling binary.
+//! The same loss code is generic over all supported autodiff backends.
 
 use burn::tensor::{Int, Tensor, backend::AutodiffBackend};
 
-// Re-export the Burn types that appear in this module's public API. Per
-// Effective Rust Item 24, a major-version bump of `burn` is a breaking change
-// of this crate's public surface; re-exporting lets downstream code import the
-// matching version through `tuplet::burn_losses::{Tensor, AutodiffBackend, Int}`
-// instead of pinning `burn` independently and risking a type-mismatch error
-// with no obvious cause.
+// Re-export aliases for the Burn types in this module's public API. Downstream
+// callers can import `BurnTensor`, `Backend`, and `BurnInt` from here to match
+// tuplet's Burn version.
 pub use burn::tensor::{Int as BurnInt, Tensor as BurnTensor, backend::AutodiffBackend as Backend};
 
 /// L2-normalize each row to unit length. Used by similarity-based losses.
@@ -169,5 +157,125 @@ mod tests {
         let n = tensor2(&[&[0.0, 1.0], &[1.0, 0.0]]);
         let loss = triplet_loss(a.clone(), p, n, 0.2);
         let _grads = loss.backward();
+    }
+
+    #[cfg(all(target_os = "macos", feature = "burn-wgpu"))]
+    mod metal_parity {
+        use super::*;
+        use burn::tensor::Device;
+        use burn_wgpu::{Wgpu, graphics::Metal, init_setup};
+
+        type Cpu = Autodiff<NdArray>;
+        type Gpu = Autodiff<Wgpu>;
+
+        fn tensor2_for<B: AutodiffBackend<FloatElem = f32>>(
+            data: &[&[f32]],
+            device: &Device<B>,
+        ) -> Tensor<B, 2> {
+            let n = data.len();
+            let d = data[0].len();
+            let flat: Vec<f32> = data.iter().flat_map(|row| row.iter().copied()).collect();
+            Tensor::<B, 1>::from_data(TensorData::new(flat, [n * d]), device).reshape([n, d])
+        }
+
+        fn gradient<B: AutodiffBackend<FloatElem = f32>>(
+            input: &Tensor<B, 2>,
+            gradients: &B::Gradients,
+        ) -> Vec<f32> {
+            input
+                .grad(gradients)
+                .expect("input requires gradients")
+                .to_data()
+                .as_slice::<f32>()
+                .expect("f32 gradient data")
+                .to_vec()
+        }
+
+        fn evaluate<B: AutodiffBackend<FloatElem = f32>>(
+            device: &Device<B>,
+        ) -> [(f32, Vec<f32>); 3] {
+            let anchors = tensor2_for::<B>(&[&[0.0, 0.0], &[0.0, 1.0]], device).require_grad();
+            let positives = tensor2_for::<B>(&[&[0.3, 0.3], &[0.2, 0.8]], device).require_grad();
+            let negatives = tensor2_for::<B>(&[&[0.0, 0.7], &[0.5, 0.2]], device).require_grad();
+            let triplet = triplet_loss(anchors.clone(), positives.clone(), negatives.clone(), 0.8);
+            let triplet_value = triplet.clone().into_scalar();
+            let triplet_grads = triplet.backward();
+            let mut triplet_input_grads = gradient(&anchors, &triplet_grads);
+            triplet_input_grads.extend(gradient(&positives, &triplet_grads));
+            triplet_input_grads.extend(gradient(&negatives, &triplet_grads));
+
+            let a = tensor2_for::<B>(&[&[0.2, 0.4], &[0.8, -0.3]], device).require_grad();
+            let b = tensor2_for::<B>(&[&[0.6, 0.1], &[0.1, 0.2]], device).require_grad();
+            let labels =
+                Tensor::<B, 1, Int>::from_data(TensorData::new(vec![1i64, 0i64], [2]), device);
+            let contrastive = contrastive_loss(a.clone(), b.clone(), labels, 1.0);
+            let contrastive_value = contrastive.clone().into_scalar();
+            let contrastive_grads = contrastive.backward();
+            let mut contrastive_input_grads = gradient(&a, &contrastive_grads);
+            contrastive_input_grads.extend(gradient(&b, &contrastive_grads));
+
+            let info_anchors = tensor2_for::<B>(&[&[1.0, 0.0], &[0.0, 1.0]], device).require_grad();
+            let info_positives =
+                tensor2_for::<B>(&[&[1.0, 0.0], &[0.0, 1.0]], device).require_grad();
+            let infonce = infonce_loss(info_anchors.clone(), info_positives.clone(), 1.0);
+            let infonce_value = infonce.clone().into_scalar();
+            let infonce_grads = infonce.backward();
+            let mut infonce_input_grads = gradient(&info_anchors, &infonce_grads);
+            infonce_input_grads.extend(gradient(&info_positives, &infonce_grads));
+
+            [
+                (triplet_value, triplet_input_grads),
+                (contrastive_value, contrastive_input_grads),
+                (infonce_value, infonce_input_grads),
+            ]
+        }
+
+        #[test]
+        #[ignore = "requires a Metal GPU"]
+        fn loss_values_and_input_gradients_match_ndarray() {
+            let cpu = evaluate::<Cpu>(&Default::default());
+            for ((name, actual), expected) in [
+                ("triplet", cpu[0].0),
+                ("contrastive", cpu[1].0),
+                ("infonce", cpu[2].0),
+            ]
+            .into_iter()
+            .zip([0.331_854_34, 0.134_767_52, 0.313_261_7])
+            {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{name} CPU loss differs: expected {expected}, got {actual}"
+                );
+            }
+
+            let device = Default::default();
+            init_setup::<Metal>(&device, Default::default());
+            let metal = evaluate::<Gpu>(&device);
+
+            for (name, (cpu_result, metal_result)) in ["triplet", "contrastive", "infonce"]
+                .into_iter()
+                .zip(cpu.iter().zip(metal.iter()))
+            {
+                assert!(
+                    (cpu_result.0 - metal_result.0).abs() < 1e-4,
+                    "{name} loss differs: CPU={} Metal={}",
+                    cpu_result.0,
+                    metal_result.0
+                );
+                assert_eq!(
+                    cpu_result.1.len(),
+                    metal_result.1.len(),
+                    "{name} gradient length differs"
+                );
+                for (index, (cpu_grad, metal_grad)) in
+                    cpu_result.1.iter().zip(metal_result.1.iter()).enumerate()
+                {
+                    assert!(
+                        (cpu_grad - metal_grad).abs() < 1e-4,
+                        "{name} gradient {index} differs: CPU={cpu_grad} Metal={metal_grad}"
+                    );
+                }
+            }
+        }
     }
 }

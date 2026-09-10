@@ -2,7 +2,7 @@
 
 [package]
 name = "tuplet"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Tuple-based metric learning: contrastive losses, hard-negative mining, and classical Mahalanobis methods on Burn tensors"
@@ -22,11 +22,13 @@ innr = { version = "0.4", optional = true }
 rand = { version = "0.9", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
-burn = { version = "0.20", features = ["autodiff"], optional = true }
-burn-autodiff = { version = "0.20", optional = true }
-burn-ndarray = { version = "0.20", features = ["rayon"], optional = true }
-burn-wgpu = { version = "0.20", optional = true }
-burn-tch = { version = "0.20", optional = true }
+# Burn 0.21's optional backends require Rust 1.92; the default pure-Rust
+# feature set remains supported at this crate's declared Rust 1.85 floor.
+burn = { version = "0.21", features = ["autodiff"], optional = true }
+burn-autodiff = { version = "0.21", optional = true }
+burn-ndarray = { version = "0.21", features = ["rayon"], optional = true }
+burn-wgpu = { version = "0.21", optional = true }
+burn-tch = { version = "0.21", optional = true }
 
 [features]
 default = ["mining"]

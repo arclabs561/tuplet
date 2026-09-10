@@ -10,13 +10,13 @@
 //! Run: `cargo run --features burn-ndarray --example burn_training`
 
 use burn::backend::Autodiff;
-use burn::tensor::{Tensor, TensorData, backend::Backend};
+use burn::tensor::{Tensor, TensorData, backend::BackendTypes};
 use burn_ndarray::NdArray;
 use tuplet::burn_losses;
 
 type B = Autodiff<NdArray>;
 
-fn batch(rows: &[&[f32]], device: &<B as Backend>::Device) -> Tensor<B, 2> {
+fn batch(rows: &[&[f32]], device: &<B as BackendTypes>::Device) -> Tensor<B, 2> {
     let n = rows.len();
     let d = rows[0].len();
     let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();

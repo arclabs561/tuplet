@@ -10,24 +10,31 @@ learning (NCA, LMNN, ITML, KISSME) are pure Rust and need no autograd backend.
 
 ```toml
 [dependencies]
-tuplet = "0.2"
+tuplet = "0.3"
 
 # CPU training (default Burn backend):
-tuplet = { version = "0.2", features = ["burn-ndarray"] }
+tuplet = { version = "0.3", features = ["burn-ndarray"] }
 
 # WGPU / Metal / Vulkan / WebGPU:
-tuplet = { version = "0.2", default-features = false, features = ["mining", "burn-wgpu"] }
+tuplet = { version = "0.3", default-features = false, features = ["mining", "burn-wgpu"] }
 
 # libtorch:
-tuplet = { version = "0.2", default-features = false, features = ["mining", "burn-tch"] }
+tuplet = { version = "0.3", default-features = false, features = ["mining", "burn-tch"] }
 
 # CUDA (extends burn-ndarray):
-tuplet = { version = "0.2", features = ["burn-cuda"] }
+tuplet = { version = "0.3", features = ["burn-cuda"] }
 ```
 
-Pick exactly one `burn-*` backend per binary. The autograd backend is wired
-through the chosen Burn backend; you don't need to enable `burn-autodiff`
-yourself.
+Enable the `burn-*` feature for each backend type used by the binary. The
+autograd backend is wired through that feature; you don't need to enable
+`burn-autodiff` yourself. The default feature set supports Rust 1.85; a
+`burn-*` backend uses Burn 0.21 and requires Rust 1.92.
+
+### Burn 0.21 migration
+
+Update direct Burn dependencies to 0.21. Burn moved the `Device` associated
+type from `Backend` to `BackendTypes`; replace `<B as Backend>::Device` with
+`<B as BackendTypes>::Device` in application code.
 
 ## Losses
 
