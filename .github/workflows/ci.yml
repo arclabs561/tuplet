@@ -19,12 +19,12 @@ jobs:
           - name: default
             features: ""
             toolchain: "1.85.0"
-          - name: burn-ndarray
-            features: "--no-default-features --features mining,burn-ndarray"
+          - name: burn-flex
+            features: "--no-default-features --features mining,burn-flex"
             toolchain: stable
           - name: burn-msrv
-            features: "--no-default-features --features mining,burn-ndarray"
-            toolchain: "1.92.0"
+            features: "--no-default-features --features mining,burn-flex"
+            toolchain: "1.95.0"
           - name: simd
             features: "--features simd"
             toolchain: stable
@@ -47,9 +47,9 @@ jobs:
           cargo run --example metric_learning
           cargo run --example embedding_training
           cargo run --example mining_pipeline
-      - name: Run examples (burn-ndarray)
-        if: matrix.name == 'burn-ndarray'
-        run: cargo run --no-default-features --features mining,burn-ndarray --example burn_training
+      - name: Run examples (burn-flex)
+        if: matrix.name == 'burn-flex'
+        run: cargo run --no-default-features --features mining,burn-flex --example burn_training
   metal-compile:
     runs-on: macos-latest
     steps:
@@ -60,8 +60,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Compile GPU tests
-        run: cargo check --all-targets --no-default-features --features mining,burn-ndarray,burn-wgpu
+      - name: Compile Metal tests
+        run: cargo check --all-targets --no-default-features --features mining,burn-flex,burn-metal
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -75,10 +75,10 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Format
         run: cargo fmt -- --check
-      # CPU checks run without requiring accelerated backend runtimes.
+      # CPU checks run on the supported pure-Rust runtime.
       - name: Clippy (default)
         run: cargo clippy --all-targets -- -D warnings
-      - name: Clippy (burn-ndarray)
-        run: cargo clippy --all-targets --no-default-features --features mining,burn-ndarray -- -D warnings
-      - name: Doc (burn-ndarray)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features mining,burn-ndarray
+      - name: Clippy (burn-flex)
+        run: cargo clippy --all-targets --no-default-features --features mining,burn-flex -- -D warnings
+      - name: Doc (burn-flex)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --features mining,burn-flex

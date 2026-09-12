@@ -4,6 +4,17 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** optional Burn losses now use the pinned Burn 0.22 development
+  revision and runtime-dispatched `Tensor<D>` values. Callers no longer supply
+  a `Backend` type parameter or `BackendTypes` device associated type.
+- Added `burn-flex` for the CPU runtime and `burn-metal` for the Metal runtime.
+  Existing `burn-ndarray`, `burn-wgpu`, `burn-tch`, and `burn-cuda` feature
+  names remain available; multiple backend features may coexist.
+- The default pure-Rust feature set remains Rust 1.85. Any `burn-*` feature on
+  the development branch requires Rust 1.95.
+
 ## [0.3.0] - 2026-09-10
 
 ### Changed

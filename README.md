@@ -10,36 +10,49 @@ learning (NCA, LMNN, ITML, KISSME) are pure Rust and need no autograd backend.
 
 ```toml
 [dependencies]
-tuplet = "0.3"
-
-# CPU training (default Burn backend):
-tuplet = { version = "0.3", features = ["burn-ndarray"] }
-
-# WGPU / Metal / Vulkan / WebGPU:
-tuplet = { version = "0.3", default-features = false, features = ["mining", "burn-wgpu"] }
-
-# libtorch:
-tuplet = { version = "0.3", default-features = false, features = ["mining", "burn-tch"] }
-
-# CUDA (extends burn-ndarray):
-tuplet = { version = "0.3", features = ["burn-cuda"] }
+# Unreleased development API, pure-Rust features only:
+tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main" }
 ```
 
-Enable the `burn-*` feature for each backend type used by the binary. The
-autograd backend is wired through that feature; you don't need to enable
-`burn-autodiff` yourself. The default feature set supports Rust 1.85; a
-`burn-*` backend uses Burn 0.21 and requires Rust 1.92.
+For an application that uses Burn tensors, enable any required Tuplet runtime
+features. This CPU configuration also pins the direct Burn dependency needed by
+the Rust code below:
 
-### Burn 0.21 migration
+```toml
+[dependencies]
+tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main", features = ["burn-flex"] }
+burn = { git = "https://github.com/tracel-ai/burn", rev = "1414c8a14e5169ef5e5fc67f9b8ab01a25d6352d", default-features = false, features = ["std", "autodiff", "flex"] }
+```
 
-Update direct Burn dependencies to 0.21. Burn moved the `Device` associated
-type from `Backend` to `BackendTypes`; replace `<B as Backend>::Device` with
-`<B as BackendTypes>::Device` in application code.
+For Metal, replace `burn-flex` / `flex` with `burn-metal` / `metal`, and add
+`fusion` to Burn's features:
+
+```toml
+[dependencies]
+tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main", features = ["burn-metal"] }
+burn = { git = "https://github.com/tracel-ai/burn", rev = "1414c8a14e5169ef5e5fc67f9b8ab01a25d6352d", default-features = false, features = ["std", "autodiff", "metal", "fusion"] }
+```
+
+The default pure-Rust feature set supports Rust 1.85. Any `burn-*` feature on
+the development branch uses the pinned Burn 0.22 revision and requires Rust
+1.95. Multiple `burn-*` features may be enabled together; `burn-ndarray`,
+`burn-wgpu`, `burn-tch`, and `burn-cuda` remain available alongside the new
+`burn-flex` and `burn-metal` features.
+
+The latest crates.io release, Tuplet 0.3, remains on Burn 0.21.
+
+### Burn 0.22 development migration
+
+Burn 0.22 dispatches `Tensor<D>` through its runtime device. Replace generic
+`Tensor<B, D>` APIs and `Backend`/`BackendTypes` device plumbing with
+`Tensor<D>` and `Device`. For CPU training use `Device::flex().autodiff()`;
+for Metal use `Device::metal(Default::default()).autodiff()`.
 
 ## Losses
 
 The Burn implementations of triplet, contrastive, and InfoNCE losses operate on
-`Tensor<B: AutodiffBackend, _>` and return a scalar tensor for `.backward()`.
+runtime-dispatched `Tensor<_>` values and return a scalar tensor for
+`.backward()`.
 The other losses in this table use the pure-Rust slice API.
 
 | Loss | Function | Reference |
@@ -80,16 +93,20 @@ metrics.
 ## Usage
 
 ```rust
-use burn::backend::{Autodiff, NdArray};
-use burn::tensor::Tensor;
+use burn::tensor::{DType, Device, Tensor};
 use tuplet::burn_losses;
 
-type B = Autodiff<NdArray>;
-let device = Default::default();
+let device = Device::flex().autodiff();
 
-let anchors:   Tensor<B, 2> = Tensor::from_floats([[1.0, 0.0], [0.0, 1.0]], &device);
-let positives: Tensor<B, 2> = Tensor::from_floats([[0.9, 0.1], [0.1, 0.9]], &device);
-let negatives: Tensor<B, 2> = Tensor::from_floats([[0.0, 1.0], [1.0, 0.0]], &device);
+let anchors = Tensor::<2>::from_data(
+    [[1.0, 0.0], [0.0, 1.0]], (&device, DType::F32),
+).require_grad();
+let positives = Tensor::<2>::from_data(
+    [[0.9, 0.1], [0.1, 0.9]], (&device, DType::F32),
+);
+let negatives = Tensor::<2>::from_data(
+    [[0.0, 1.0], [1.0, 0.0]], (&device, DType::F32),
+);
 
 let loss = burn_losses::triplet_loss(anchors, positives, negatives, 0.2);
 let grads = loss.backward();
@@ -100,10 +117,12 @@ let grads = loss.backward();
 | Feature | What it adds |
 |---------|-------------|
 | `mining` (default) | Negative miners |
-| `burn-ndarray` | Burn losses with `NdArray` autodiff backend (multi-core CPU) |
+| `burn-flex` | Burn losses with the Flex CPU runtime |
+| `burn-ndarray` | Burn losses with Burn's ndarray runtime |
 | `burn-wgpu` | Burn losses on Metal / Vulkan / WebGPU |
+| `burn-metal` | Burn losses on Burn's Metal runtime with fusion |
 | `burn-tch` | Burn losses on libtorch |
-| `burn-cuda` | Burn losses on CUDA (extends `burn-ndarray`) |
+| `burn-cuda` | Burn losses on CUDA |
 | `simd` | SIMD-accelerated similarity via [innr](https://crates.io/crates/innr) |
 | `serde` | Serialize / deserialize config structs |
 

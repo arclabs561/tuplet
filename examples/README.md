@@ -11,7 +11,7 @@ the heavier data-gated eval harness.
 | Compare classical metric learning and contrastive losses | `metric_learning` | Pure Rust |
 | Train embeddings without a tensor framework | `embedding_training` | Pure Rust |
 | Connect miners to losses | `mining_pipeline` | Pure Rust |
-| Check Burn losses forward and backward | `burn_training` | Requires `burn-ndarray` |
+| Check Burn losses forward and backward | `burn_training` | Requires `burn-flex` |
 | Train supervised embeddings on Fashion-MNIST | `fashion_metric_learning` | Data-gated eval |
 
 ## Pure Rust
@@ -98,11 +98,12 @@ Mean grad norm: 0.1793
 
 ### `burn_training`: do Burn losses compute forward and backward?
 
-Computes triplet, InfoNCE, and contrastive losses on the `NdArray` autodiff
-backend and calls `.backward()` on each.
+Computes triplet, InfoNCE, and contrastive losses on Burn's Flex CPU runtime
+with autodiff and calls `.backward()` on each. The same loss API can use a
+Metal device when `burn-metal` is enabled.
 
 ```bash
-cargo run --release --features burn-ndarray --example burn_training
+cargo run --release --features burn-flex --example burn_training
 ```
 
 ```text
@@ -110,7 +111,7 @@ triplet_loss = 0.0000
 infonce_loss = 0.0400
 contrastive_loss = 0.0025
 
-All three losses computed forward + backward on Autodiff<NdArray>.
+All three losses computed forward + backward on Flex with f32 autodiff.
 ```
 
 ## Data-Gated Eval

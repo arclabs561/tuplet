@@ -2,7 +2,7 @@
 
 [package]
 name = "tuplet"
-version = "0.3.0"
+version = "0.4.0-dev"
 edition = "2024"
 rust-version = "1.85"
 description = "Tuple-based metric learning: contrastive losses, hard-negative mining, and classical Mahalanobis methods on Burn tensors"
@@ -22,13 +22,9 @@ innr = { version = "0.4", optional = true }
 rand = { version = "0.9", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
-# Burn 0.21's optional backends require Rust 1.92; the default pure-Rust
+# The pinned Burn development revision requires Rust 1.95; the default pure-Rust
 # feature set remains supported at this crate's declared Rust 1.85 floor.
-burn = { version = "0.21", features = ["autodiff"], optional = true }
-burn-autodiff = { version = "0.21", optional = true }
-burn-ndarray = { version = "0.21", features = ["rayon"], optional = true }
-burn-wgpu = { version = "0.21", optional = true }
-burn-tch = { version = "0.21", optional = true }
+burn = { git = "https://github.com/tracel-ai/burn", rev = "1414c8a14e5169ef5e5fc67f9b8ab01a25d6352d", default-features = false, features = ["std", "autodiff"], optional = true }
 
 [features]
 default = ["mining"]
@@ -38,15 +34,21 @@ simd = ["dep:innr"]
 
 # Private umbrella that the public burn-* features pull in; lets `burn_losses`
 # gate on a single `feature = "_burn"` instead of enumerating every backend.
-_burn = ["dep:burn", "dep:burn-autodiff"]
+_burn = ["dep:burn"]
 
-# Burn backends. Pick one (and only one) when using the autograd loss API.
-# burn-ndarray is the safe CPU default; burn-wgpu/tch/cuda are for accelerated training.
-burn-ndarray = ["_burn", "dep:burn-ndarray"]
-burn-wgpu = ["_burn", "dep:burn-wgpu"]
-burn-tch = ["_burn", "dep:burn-tch"]
-burn-cuda = ["burn-ndarray", "burn/cuda"]
+# Enable device constructors; multiple backends can coexist.
+# Flex is the CPU default; ndarray and tch remain upstream compatibility paths.
+burn-flex = ["_burn", "burn/flex"]
+burn-ndarray = ["_burn", "burn/ndarray"]
+burn-wgpu = ["_burn", "burn/wgpu"]
+burn-metal = ["_burn", "burn/metal", "burn/fusion"]
+burn-tch = ["_burn", "burn/tch"]
+burn-cuda = ["_burn", "burn/cuda"]
 
 [[example]]
 name = "burn_training"
-required-features = ["burn-ndarray"]
+required-features = ["burn-flex"]
+
+[[example]]
+name = "mining_pipeline"
+required-features = ["mining"]
