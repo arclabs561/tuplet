@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 //! Tuple-based metric learning: contrastive losses, hard-negative mining, and
 //! classical Mahalanobis distance learning. Autograd losses run on Burn tensors;
 //! similarity functions, classical learners, and miners are pure Rust.

@@ -9,6 +9,7 @@ description = "Tuple-based metric learning: contrastive losses, hard-negative mi
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arclabs561/tuplet"
 categories = ["science", "algorithms"]
+include = ["/src", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
 keywords = [
   "metric-learning",
   "contrastive",
@@ -22,9 +23,9 @@ innr = { version = "0.4", optional = true }
 rand = { version = "0.9", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
-# The pinned Burn development revision requires Rust 1.95; the default pure-Rust
-# feature set remains supported at this crate's declared Rust 1.85 floor.
-burn = { git = "https://github.com/tracel-ai/burn", rev = "1414c8a14e5169ef5e5fc67f9b8ab01a25d6352d", default-features = false, features = ["std", "autodiff"], optional = true }
+# Burn 0.22 requires Rust 1.95; the default pure-Rust feature set remains
+# supported at this crate's declared Rust 1.85 floor.
+burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff"], optional = true }
 
 [features]
 default = ["mining"]

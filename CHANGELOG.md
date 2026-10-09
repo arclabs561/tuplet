@@ -4,8 +4,17 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 ## Unreleased
 
+### Added
+
+- `DistanceFn::distance`, and `mine_with_distance` on `HardestMiner`,
+  `SemiHardMiner` and `DistanceWeightedMiner`, so mining uses the loss's
+  distance instead of always cosine.
+- `RandomMiner::mine_with_rng` for seeded, reproducible mining.
+
 ### Changed
 
+- Optional Burn losses depend on crates.io Burn 0.22.0 instead of a git
+  revision.
 - **Breaking:** optional Burn losses now use the pinned Burn 0.22 development
   revision and runtime-dispatched `Tensor<D>` values. Callers no longer supply
   a `Backend` type parameter or `BackendTypes` device associated type.

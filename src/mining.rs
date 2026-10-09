@@ -1,3 +1,4 @@
+use crate::losses::DistanceFn;
 use crate::similarity::cosine_similarity;
 use rand::seq::SliceRandom;
 
@@ -35,12 +36,41 @@ impl HardestMiner {
 
         best_idx.into_iter().collect()
     }
+
+    /// Returns the index of the nearest non-excluded candidate under `distance`.
+    ///
+    /// Pass the same [`DistanceFn`] the loss uses (the default
+    /// [`triplet_loss`](crate::triplet_loss) is [`DistanceFn::Euclidean`]).
+    pub fn mine_with_distance(
+        &self,
+        anchor: &[f32],
+        pool: &[&[f32]],
+        exclude: &[usize],
+        distance: DistanceFn,
+    ) -> Vec<usize> {
+        let mut best_idx = None;
+        let mut best_dist = f32::INFINITY;
+        for (i, candidate) in pool.iter().enumerate() {
+            if exclude.contains(&i) {
+                continue;
+            }
+            let d = distance.distance(anchor, candidate);
+            if d < best_dist {
+                best_dist = d;
+                best_idx = Some(i);
+            }
+        }
+        best_idx.into_iter().collect()
+    }
 }
 
 /// Selects negatives within a semi-hard margin band.
 ///
-/// A semi-hard negative satisfies: `d(a, p) < d(a, n) < d(a, p) + margin`,
-/// where distance is `1 - cosine_similarity`.
+/// A semi-hard negative satisfies: `d(a, p) < d(a, n) < d(a, p) + margin`.
+/// [`mine`](Self::mine) uses cosine distance, `1 - cosine_similarity`; use
+/// [`mine_with_distance`](Self::mine_with_distance) with the loss's
+/// [`DistanceFn`] so the band matches where that loss is nonzero (the default
+/// [`triplet_loss`](crate::triplet_loss) is Euclidean).
 #[derive(Debug, Clone)]
 pub struct SemiHardMiner {
     /// Width of the margin band.
@@ -70,6 +100,29 @@ impl SemiHardMiner {
             })
             .collect()
     }
+
+    /// Mine semi-hard negatives under `distance`.
+    ///
+    /// `positive_distance` is `distance.distance(anchor, positive)`.
+    pub fn mine_with_distance(
+        &self,
+        anchor: &[f32],
+        pool: &[&[f32]],
+        exclude: &[usize],
+        positive_distance: f32,
+        distance: DistanceFn,
+    ) -> Vec<usize> {
+        let upper = positive_distance + self.margin;
+        (0..pool.len())
+            .filter(|i| {
+                if exclude.contains(i) {
+                    return false;
+                }
+                let d_an = distance.distance(anchor, pool[*i]);
+                d_an > positive_distance && d_an < upper
+            })
+            .collect()
+    }
 }
 
 /// Selects `k` random non-excluded negatives.
@@ -85,6 +138,23 @@ impl RandomMiner {
         let mut candidates: Vec<usize> = (0..pool.len()).filter(|i| !exclude.contains(i)).collect();
         let mut rng = rand::rng();
         candidates.shuffle(&mut rng);
+        candidates.truncate(self.k);
+        candidates
+    }
+
+    /// Returns up to `k` random non-excluded indices drawn from `rng`.
+    ///
+    /// Pass a seeded generator (for example `rand::rngs::StdRng::seed_from_u64`)
+    /// for reproducible mining; [`mine`](Self::mine) uses the thread RNG.
+    pub fn mine_with_rng<R: rand::Rng + ?Sized>(
+        &self,
+        _anchor: &[f32],
+        pool: &[&[f32]],
+        exclude: &[usize],
+        rng: &mut R,
+    ) -> Vec<usize> {
+        let mut candidates: Vec<usize> = (0..pool.len()).filter(|i| !exclude.contains(i)).collect();
+        candidates.shuffle(rng);
         candidates.truncate(self.k);
         candidates
     }
@@ -166,13 +236,28 @@ pub struct DistanceWeightedMiner {
 
 impl DistanceWeightedMiner {
     /// Returns indices of candidates within the distance band `[cutoff, nonzero_loss_cutoff]`.
+    ///
+    /// Distance is `1 - cosine_similarity`; see
+    /// [`mine_with_distance`](Self::mine_with_distance) to match a loss's distance.
     pub fn mine(&self, anchor: &[f32], pool: &[&[f32]], exclude: &[usize]) -> Vec<usize> {
+        self.mine_with_distance(anchor, pool, exclude, DistanceFn::Cosine)
+    }
+
+    /// Returns indices of candidates whose `distance` to the anchor lies in
+    /// `[cutoff, nonzero_loss_cutoff]`.
+    pub fn mine_with_distance(
+        &self,
+        anchor: &[f32],
+        pool: &[&[f32]],
+        exclude: &[usize],
+        distance: DistanceFn,
+    ) -> Vec<usize> {
         (0..pool.len())
             .filter(|i| {
                 if exclude.contains(i) {
                     return false;
                 }
-                let d = 1.0 - cosine_similarity(anchor, pool[*i]);
+                let d = distance.distance(anchor, pool[*i]);
                 d >= self.cutoff && d <= self.nonzero_loss_cutoff
             })
             .collect()
@@ -270,6 +355,63 @@ mod tests {
         );
         for &idx in &result {
             assert!(idx < pool.len(), "index should be in range");
+        }
+    }
+
+    #[test]
+    fn seeded_random_miner_is_reproducible() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let anchor: &[f32] = &[1.0, 0.0];
+        let points: Vec<[f32; 2]> = (0..32).map(|i| [i as f32, 1.0]).collect();
+        let pool: Vec<&[f32]> = points.iter().map(|p| p.as_slice()).collect();
+        let miner = RandomMiner { k: 5 };
+
+        let first = miner.mine_with_rng(anchor, &pool, &[3], &mut StdRng::seed_from_u64(7));
+        for _ in 0..20 {
+            let again = miner.mine_with_rng(anchor, &pool, &[3], &mut StdRng::seed_from_u64(7));
+            assert_eq!(first, again);
+        }
+        assert_eq!(first.len(), 5);
+        assert!(!first.contains(&3));
+    }
+
+    #[test]
+    fn semi_hard_band_matches_where_the_triplet_loss_is_active() {
+        // Semi-hard (Schroff et al. 2015): d(a,p) < d(a,n) and the triplet loss
+        // is positive. Mining with the loss's own distance must pick exactly those.
+        let anchor: &[f32] = &[0.1, 0.0];
+        let positive: &[f32] = &[1.0, 0.0];
+        let points: Vec<[f32; 2]> = vec![
+            [0.5, 0.0],  // nearer than the positive (Euclidean)
+            [1.1, 0.0],  // semi-hard (Euclidean)
+            [1.0, 0.3],  // semi-hard under both distances
+            [0.0, 1.15], // too far (Euclidean)
+            [3.0, 0.0],  // too far (Euclidean)
+            [2.0, 2.0],  // too far under both
+        ];
+        let pool: Vec<&[f32]> = points.iter().map(|p| p.as_slice()).collect();
+        let margin = 0.2;
+        let miner = SemiHardMiner { margin };
+
+        for distance in [DistanceFn::Euclidean, DistanceFn::Cosine] {
+            let d_ap = distance.distance(anchor, positive);
+            let mined = miner.mine_with_distance(anchor, &pool, &[], d_ap, distance);
+            let want: Vec<usize> = (0..pool.len())
+                .filter(|&i| {
+                    let loss = crate::triplet_loss_with_distance(
+                        &[anchor],
+                        &[positive],
+                        &[pool[i]],
+                        margin,
+                        distance,
+                    )
+                    .loss;
+                    distance.distance(anchor, pool[i]) > d_ap && loss > 0.0
+                })
+                .collect();
+            assert_eq!(mined, want, "{distance:?}");
         }
     }
 

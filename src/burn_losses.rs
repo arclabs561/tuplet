@@ -66,11 +66,13 @@ pub fn contrastive_loss(
     (pos_term + neg_term).mean().unsqueeze()
 }
 
-/// InfoNCE / NT-Xent over anchor / positive pairs in a batch.
+/// Symmetric InfoNCE over anchor / positive pairs in a batch.
 ///
 /// Each anchor's positive is paired by row index; all other rows in
 /// `positives` serve as negatives. Symmetric variant: also computes the
-/// loss with anchors / positives swapped, then averages.
+/// loss with anchors / positives swapped, then averages. The slice
+/// [`crate::losses::infonce_loss`] is one-directional, so the two differ.
+/// Neither is SimCLR's NT-Xent over all 2N views.
 pub fn infonce_loss(anchors: Tensor<2>, positives: Tensor<2>, temperature: f32) -> Tensor<1> {
     let device = anchors.device();
     let n = anchors.dims()[0];
@@ -150,6 +152,84 @@ mod tests {
         let n = tensor2(&[&[0.0, 1.0], &[1.0, 0.0]], &device);
         let loss = triplet_loss(a.clone(), p, n, 0.2);
         let _ = loss.backward();
+    }
+
+    fn input_gradient(input: &Tensor<2>, gradients: &burn::tensor::Gradients) -> Vec<f32> {
+        input
+            .grad(gradients)
+            .expect("input requires gradients")
+            .to_data()
+            .as_slice::<f32>()
+            .expect("f32 gradient data")
+            .to_vec()
+    }
+
+    fn assert_close(burn: &[f32], slice: &[Vec<f32>], what: &str) {
+        let slice: Vec<f32> = slice.iter().flatten().copied().collect();
+        assert_eq!(burn.len(), slice.len(), "{what}: length");
+        for (i, (b, s)) in burn.iter().zip(&slice).enumerate() {
+            assert!((b - s).abs() < 1e-5, "{what}[{i}]: burn {b} vs slice {s}");
+        }
+    }
+
+    #[test]
+    fn triplet_value_and_gradients_match_the_slice_implementation() {
+        let anchors: [&[f32]; 3] = [&[0.0, 0.0], &[0.0, 1.0], &[1.0, -0.5]];
+        let positives: [&[f32]; 3] = [&[0.3, 0.3], &[0.2, 0.8], &[0.4, 0.4]];
+        let negatives: [&[f32]; 3] = [&[0.0, 0.7], &[0.5, 0.2], &[3.0, 3.0]];
+        let margin = 0.8;
+        let slice = crate::losses::triplet_loss(&anchors, &positives, &negatives, margin);
+
+        let device = Device::flex().autodiff();
+        let a = tensor2(&anchors, &device).require_grad();
+        let p = tensor2(&positives, &device).require_grad();
+        let n = tensor2(&negatives, &device).require_grad();
+        let loss = triplet_loss(a.clone(), p.clone(), n.clone(), margin);
+        let value: f32 = loss.clone().into_scalar();
+        let grads = loss.backward();
+
+        assert!(
+            (value - slice.loss).abs() < 1e-5,
+            "{value} vs {}",
+            slice.loss
+        );
+        assert_close(&input_gradient(&a, &grads), &slice.grad_anchors, "anchors");
+        assert_close(
+            &input_gradient(&p, &grads),
+            &slice.grad_positives,
+            "positives",
+        );
+        assert_close(
+            &input_gradient(&n, &grads),
+            &slice.grad_negatives,
+            "negatives",
+        );
+    }
+
+    #[test]
+    fn contrastive_value_and_gradients_match_the_slice_implementation() {
+        let left: [&[f32]; 3] = [&[0.2, 0.4], &[0.8, -0.3], &[0.0, 0.0]];
+        let right: [&[f32]; 3] = [&[0.6, 0.1], &[0.1, 0.2], &[0.3, 0.1]];
+        let labels = [true, false, false];
+        let margin = 1.0;
+        let pairs: Vec<(&[f32], &[f32])> = left.iter().copied().zip(right).collect();
+        let slice = crate::losses::contrastive_loss(&pairs, &labels, margin);
+
+        let device = Device::flex().autodiff();
+        let a = tensor2(&left, &device).require_grad();
+        let b = tensor2(&right, &device).require_grad();
+        let same = Tensor::<1, Int>::from_ints([1, 0, 0], &device);
+        let loss = contrastive_loss(a.clone(), b.clone(), same, margin);
+        let value: f32 = loss.clone().into_scalar();
+        let grads = loss.backward();
+
+        assert!(
+            (value - slice.loss).abs() < 1e-5,
+            "{value} vs {}",
+            slice.loss
+        );
+        assert_close(&input_gradient(&a, &grads), &slice.grad_anchors, "left");
+        assert_close(&input_gradient(&b, &grads), &slice.grad_positives, "right");
     }
 
     #[cfg(all(target_os = "macos", feature = "burn-metal"))]

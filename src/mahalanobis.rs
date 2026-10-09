@@ -380,7 +380,7 @@ pub fn lmnn(data: &[&[f32]], labels: &[usize], out_dim: usize, config: &LmnnConf
                 .filter(|&j| j != i && labels[j] == labels[i])
                 .map(|j| (j, euclidean_distance(data[i], data[j])))
                 .collect();
-            same_class.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            same_class.sort_by(|a, b| a.1.total_cmp(&b.1));
             same_class
                 .iter()
                 .take(config.k)
@@ -1286,6 +1286,33 @@ mod tests {
 
         // Output should have correct dimensions
         assert_eq!(l.len(), 4, "L should be 2x2 = 4 elements");
+    }
+
+    #[test]
+    fn lmnn_neighbor_ranking_with_nan_points_does_not_panic() {
+        // Rust 1.81+ sorts may panic on a comparator that is not a total order;
+        // NaN distances made `partial_cmp(..).unwrap_or(Equal)` one.
+        let points: Vec<[f32; 2]> = (0..40)
+            .map(|i| {
+                if i % 3 == 0 {
+                    [f32::NAN, i as f32]
+                } else {
+                    [i as f32 * 0.1, (i % 7) as f32]
+                }
+            })
+            .collect();
+        let labels: Vec<usize> = (0..40).map(|i| usize::from(i >= 35)).collect();
+        let data_refs: Vec<&[f32]> = points.iter().map(|p| p.as_slice()).collect();
+        let config = LmnnConfig {
+            lr: 0.01,
+            max_iter: 1,
+            tol: 1e-8,
+            k: 3,
+            margin: 1.0,
+            mu: 0.5,
+        };
+        let l = lmnn(&data_refs, &labels, 2, &config);
+        assert_eq!(l.len(), 4);
     }
 
     #[test]

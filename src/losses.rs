@@ -44,6 +44,18 @@ pub enum DistanceFn {
     Cosine,
 }
 
+impl DistanceFn {
+    /// Distance between `a` and `b` under this selector, as the triplet loss
+    /// computes it. Miners that take a `DistanceFn` use this, so mining and
+    /// the loss measure the same quantity.
+    pub fn distance(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            DistanceFn::Euclidean => euclidean_distance(a, b),
+            DistanceFn::Cosine => 1.0 - cosine_similarity(a, b),
+        }
+    }
+}
+
 /// Triplet loss: `max(0, d(a,p) - d(a,n) + margin)`, averaged over the batch.
 pub fn triplet_loss(
     anchors: &[&[f32]],
@@ -159,9 +171,12 @@ pub fn triplet_loss_with_distance(
     }
 }
 
-/// InfoNCE (NT-Xent) loss with in-batch negatives.
+/// InfoNCE loss with in-batch negatives, one direction (anchors to positives).
 ///
 /// For anchor i, the positive is `positives[i]` and negatives are all `positives[j]` where `j != i`.
+/// The Burn `burn_losses::infonce_loss` averages both directions instead, so the two
+/// return different values for the same batch. Neither is SimCLR's NT-Xent over all
+/// 2N views.
 pub fn infonce_loss(anchors: &[&[f32]], positives: &[&[f32]], temperature: f32) -> LossOutput {
     let batch = anchors.len();
     assert_eq!(batch, positives.len());
@@ -483,7 +498,8 @@ where
 ///
 /// For similar pairs (`label = true`): `L = d^2`.
 /// For dissimilar pairs (`label = false`): `L = max(0, margin - d)^2`.
-/// Uses Euclidean distance.
+/// Uses Euclidean distance. Hadsell et al. Eq. 4 has a factor of 1/2 on both
+/// terms; this omits it, so values and gradients are twice the paper's.
 pub fn contrastive_loss(pairs: &[(&[f32], &[f32])], labels: &[bool], margin: f32) -> LossOutput {
     assert_eq!(pairs.len(), labels.len());
     let n = pairs.len();
@@ -545,8 +561,8 @@ pub fn contrastive_loss(pairs: &[(&[f32], &[f32])], labels: &[bool], margin: f32
 /// Multi-Similarity Loss (Wang et al., CVPR 2019).
 ///
 /// Considers self-similarity, negative relative similarity, and positive relative similarity.
-/// Uses cosine similarity. `alpha` weights negative pairs, `beta` weights positive pairs,
-/// `base` is a similarity offset.
+/// Uses cosine similarity. `alpha` weights positive pairs, `beta` weights negative pairs
+/// (Wang et al. Eq. 8), `base` is a similarity offset.
 pub fn multi_similarity_loss(
     embeddings: &[&[f32]],
     labels: &[usize],
@@ -1274,6 +1290,10 @@ pub fn n_pairs_loss(anchors: &[&[f32]], positives: &[&[f32]], temperature: f32) 
 ///
 /// Returns loss and gradients w.r.t. embeddings (not proxies -- proxy gradients
 /// are in `grad_positives`). Embeddings and proxies are L2-normalized internally.
+///
+/// Uses `cos(theta + m)` for every target angle (Deng et al. Eq. 3). The reference
+/// implementation switches to `cos(theta) - m * sin(m)` once `theta + m > pi`; this
+/// function does not, so the target logit is not monotone in `theta` past that point.
 pub fn arcface_loss(
     embeddings: &[&[f32]],
     labels: &[usize],

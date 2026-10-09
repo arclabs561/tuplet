@@ -21,7 +21,7 @@ the Rust code below:
 ```toml
 [dependencies]
 tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main", features = ["burn-flex"] }
-burn = { git = "https://github.com/tracel-ai/burn", rev = "1414c8a14e5169ef5e5fc67f9b8ab01a25d6352d", default-features = false, features = ["std", "autodiff", "flex"] }
+burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "flex"] }
 ```
 
 For Metal, replace `burn-flex` / `flex` with `burn-metal` / `metal`, and add
@@ -30,12 +30,11 @@ For Metal, replace `burn-flex` / `flex` with `burn-metal` / `metal`, and add
 ```toml
 [dependencies]
 tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main", features = ["burn-metal"] }
-burn = { git = "https://github.com/tracel-ai/burn", rev = "1414c8a14e5169ef5e5fc67f9b8ab01a25d6352d", default-features = false, features = ["std", "autodiff", "metal", "fusion"] }
+burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "metal", "fusion"] }
 ```
 
 The default pure-Rust feature set supports Rust 1.85. Any `burn-*` feature on
-the development branch uses the pinned Burn 0.22 revision and requires Rust
-1.95. Multiple `burn-*` features may be enabled together; `burn-ndarray`,
+the development branch uses Burn 0.22 and requires Rust 1.95. Multiple `burn-*` features may be enabled together; `burn-ndarray`,
 `burn-wgpu`, `burn-tch`, and `burn-cuda` remain available alongside the new
 `burn-flex` and `burn-metal` features.
 
@@ -59,7 +58,7 @@ The other losses in this table use the pure-Rust slice API.
 |------|----------|-----------|
 | Triplet | `triplet_loss` | Schroff et al. 2015 |
 | Contrastive | `contrastive_loss` | Hadsell et al. 2006 |
-| InfoNCE / NT-Xent | `infonce_loss` | Oord et al. 2018 |
+| InfoNCE (slice: one direction; Burn: symmetric) | `infonce_loss` | Oord et al. 2018 |
 | MNRL | `mnrl_loss` | Henderson et al. 2017 |
 | N-Pairs | `n_pairs_loss` | Sohn 2016 |
 | Cosine embedding | `cosine_embedding_loss` | |
@@ -92,7 +91,10 @@ metrics.
 
 ## Usage
 
+With the `burn-flex` feature:
+
 ```rust
+# #[cfg(feature = "burn-flex")] {
 use burn::tensor::{DType, Device, Tensor};
 use tuplet::burn_losses;
 
@@ -110,6 +112,7 @@ let negatives = Tensor::<2>::from_data(
 
 let loss = burn_losses::triplet_loss(anchors, positives, negatives, 0.2);
 let grads = loss.backward();
+# }
 ```
 
 ## Features
