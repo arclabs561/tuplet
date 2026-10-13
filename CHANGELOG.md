@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 ## Unreleased
 
+### Fixed
+
+- Evaluate multi-similarity loss and gradient weights without overflowing
+  intermediate exponentials for finite logits.
+
 ## [0.4.0] - 2026-10-09
 
 ### Added

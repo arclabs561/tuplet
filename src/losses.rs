@@ -601,20 +601,14 @@ pub fn multi_similarity_loss(
         }
 
         // Positive term: (1/alpha) * log(1 + sum_{p in pos} exp(-alpha*(S_ip - base)))
-        let pos_exps: Vec<f32> = pos
-            .iter()
-            .map(|&p| (-alpha * (sims[i][p] - base)).exp())
-            .collect();
-        let pos_sum: f32 = pos_exps.iter().sum();
-        total_loss += (1.0 / alpha) * (1.0 + pos_sum).ln();
+        let pos_logits: Vec<f32> = pos.iter().map(|&p| -alpha * (sims[i][p] - base)).collect();
+        let (pos_log, _) = log_one_plus_exp_sum_weights(&pos_logits);
+        total_loss += (1.0 / alpha) * pos_log;
 
         // Negative term: (1/beta) * log(1 + sum_{n in neg} exp(beta*(S_in - base)))
-        let neg_exps: Vec<f32> = neg
-            .iter()
-            .map(|&n| (beta * (sims[i][n] - base)).exp())
-            .collect();
-        let neg_sum: f32 = neg_exps.iter().sum();
-        total_loss += (1.0 / beta) * (1.0 + neg_sum).ln();
+        let neg_logits: Vec<f32> = neg.iter().map(|&n| beta * (sims[i][n] - base)).collect();
+        let (neg_log, _) = log_one_plus_exp_sum_weights(&neg_logits);
+        total_loss += (1.0 / beta) * neg_log;
     }
 
     total_loss /= n as f32;
@@ -644,18 +638,12 @@ pub fn multi_similarity_loss(
         }
 
         // Compute softmax weights for positive term
-        let pos_exps: Vec<f32> = pos
-            .iter()
-            .map(|&p| (-alpha * (sims[i][p] - base)).exp())
-            .collect();
-        let pos_denom: f32 = 1.0 + pos_exps.iter().sum::<f32>();
+        let pos_logits: Vec<f32> = pos.iter().map(|&p| -alpha * (sims[i][p] - base)).collect();
+        let (_, pos_weights) = log_one_plus_exp_sum_weights(&pos_logits);
 
         // Compute softmax weights for negative term
-        let neg_exps: Vec<f32> = neg
-            .iter()
-            .map(|&n| (beta * (sims[i][n] - base)).exp())
-            .collect();
-        let neg_denom: f32 = 1.0 + neg_exps.iter().sum::<f32>();
+        let neg_logits: Vec<f32> = neg.iter().map(|&n| beta * (sims[i][n] - base)).collect();
+        let (_, neg_weights) = log_one_plus_exp_sum_weights(&neg_logits);
 
         let norm_i = norms[i];
         if norm_i < 1e-8 {
@@ -664,7 +652,7 @@ pub fn multi_similarity_loss(
 
         // Positive pairs: dL/dS_ip = -w_p(i,p)
         for (pi, &p) in pos.iter().enumerate() {
-            let w = pos_exps[pi] / pos_denom;
+            let w = pos_weights[pi];
             if norms[p] < 1e-8 {
                 continue;
             }
@@ -684,7 +672,7 @@ pub fn multi_similarity_loss(
 
         // Negative pairs: dL/dS_in = w_n(i,n)
         for (ni, &nj) in neg.iter().enumerate() {
-            let w = neg_exps[ni] / neg_denom;
+            let w = neg_weights[ni];
             if norms[nj] < 1e-8 {
                 continue;
             }
@@ -1751,6 +1739,25 @@ impl CrossBatchMemory {
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
+}
+
+// Stable log(1 + sum(exp(logits))) and its normalized exponential weights.
+// The zero logit represents the baseline 1. Finite logits never require an
+// overflowing exponential; ln_1p retains tiny losses when all logits are <= 0.
+fn log_one_plus_exp_sum_weights(logits: &[f32]) -> (f32, Vec<f32>) {
+    let shift = logits.iter().copied().fold(0.0_f32, f32::max);
+    let mut weights: Vec<f32> = logits.iter().map(|&x| (x - shift).exp()).collect();
+    let sum: f32 = weights.iter().sum();
+    let denominator = (-shift).exp() + sum;
+    let log = if shift == 0.0 {
+        sum.ln_1p()
+    } else {
+        shift + denominator.ln()
+    };
+    for weight in &mut weights {
+        *weight /= denominator;
+    }
+    (log, weights)
 }
 
 /// Log-sum-exp of a slice, numerically stable.
