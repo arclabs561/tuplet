@@ -33,7 +33,7 @@ tuplet = { version = "0.4", features = ["burn-metal"] }
 burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "metal", "fusion"] }
 ```
 
-The default pure-Rust feature set supports Rust 1.85. Any `burn-*` feature on
+The default pure-Rust feature set supports Rust 1.85. Any `burn-*` feature in
 Tuplet 0.4 uses Burn 0.22 and requires Rust 1.95. Multiple `burn-*` features may be enabled together; `burn-ndarray`,
 `burn-wgpu`, `burn-tch`, and `burn-cuda` remain available alongside the new
 `burn-flex` and `burn-metal` features.
@@ -56,7 +56,7 @@ The other losses in this table use the pure-Rust slice API.
 
 | Loss | Function | Reference |
 |------|----------|-----------|
-| Triplet | `triplet_loss` | Schroff et al. 2015 |
+| Triplet | `triplet_loss` | Schroff et al. 2015; unsquared Euclidean variant |
 | Contrastive | `contrastive_loss` | Hadsell et al. 2006 |
 | InfoNCE (slice: one direction; Burn: symmetric) | `infonce_loss` | Oord et al. 2018 |
 | MNRL | `mnrl_loss` | Henderson et al. 2017 |
