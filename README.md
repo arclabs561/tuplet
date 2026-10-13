@@ -10,8 +10,8 @@ learning (NCA, LMNN, ITML, KISSME) are pure Rust and need no autograd backend.
 
 ```toml
 [dependencies]
-# Unreleased development API, pure-Rust features only:
-tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main" }
+# Pure-Rust features only:
+tuplet = "0.4"
 ```
 
 For an application that uses Burn tensors, enable any required Tuplet runtime
@@ -20,7 +20,7 @@ the Rust code below:
 
 ```toml
 [dependencies]
-tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main", features = ["burn-flex"] }
+tuplet = { version = "0.4", features = ["burn-flex"] }
 burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "flex"] }
 ```
 
@@ -29,18 +29,18 @@ For Metal, replace `burn-flex` / `flex` with `burn-metal` / `metal`, and add
 
 ```toml
 [dependencies]
-tuplet = { git = "https://github.com/arclabs561/tuplet", branch = "main", features = ["burn-metal"] }
+tuplet = { version = "0.4", features = ["burn-metal"] }
 burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "metal", "fusion"] }
 ```
 
 The default pure-Rust feature set supports Rust 1.85. Any `burn-*` feature on
-the development branch uses Burn 0.22 and requires Rust 1.95. Multiple `burn-*` features may be enabled together; `burn-ndarray`,
+Tuplet 0.4 uses Burn 0.22 and requires Rust 1.95. Multiple `burn-*` features may be enabled together; `burn-ndarray`,
 `burn-wgpu`, `burn-tch`, and `burn-cuda` remain available alongside the new
 `burn-flex` and `burn-metal` features.
 
-The latest crates.io release, Tuplet 0.3, remains on Burn 0.21.
+Tuplet 0.3 uses Burn 0.21; Tuplet 0.4 uses Burn 0.22.
 
-### Burn 0.22 development migration
+### Burn 0.22 migration
 
 Burn 0.22 dispatches `Tensor<D>` through its runtime device. Replace generic
 `Tensor<B, D>` APIs and `Backend`/`BackendTypes` device plumbing with
