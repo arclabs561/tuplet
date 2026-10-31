@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 ## Unreleased
 
+## 0.4.1 - 2026-10-30
+
 ### Fixed
 
 - Evaluate multi-similarity loss and gradient weights without overflowing
