@@ -1075,10 +1075,10 @@ pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f
                 continue;
             }
 
-            let lse_i = log_sum_exp(&neg_i);
-            let lse_j = log_sum_exp(&neg_j);
-
-            let loss_ij = (lse_i + lse_j + d_ij).max(0.0);
+            // Song et al. 2016 Eq. 4: one log-sum-exp over the negatives of i and
+            // of j together, log(sum_k e^(m - d_ik) + sum_l e^(m - d_jl)).
+            let joint: Vec<f32> = neg_i.iter().chain(&neg_j).copied().collect();
+            let loss_ij = (log_sum_exp(&joint) + d_ij).max(0.0);
             total_loss += loss_ij * loss_ij;
             count += 1;
         }
@@ -1091,7 +1091,7 @@ pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f
     total_loss *= 0.5;
 
     // Gradients: L = (0.5/|P|) * sum_{(i,j) in P} max(0, J_ij)^2
-    // where J_ij = lse_i + lse_j + d_ij
+    // where J_ij = log(sum_k exp(m - d_ik) + sum_l exp(m - d_jl)) + d_ij
     // For active pairs (J_ij > 0):
     //   dL/d(d_ik) = (J_ij / |P|) * (-softmax_weight_ik)  for negative k of i
     //   dL/d(d_jl) = (J_ij / |P|) * (-softmax_weight_jl)  for negative l of j
@@ -1131,10 +1131,8 @@ pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f
                     continue;
                 }
 
-                let lse_i = log_sum_exp(&neg_i_vals);
-                let lse_j = log_sum_exp(&neg_j_vals);
-
-                let j_ij = lse_i + lse_j + d_ij;
+                let joint: Vec<f32> = neg_i_vals.iter().chain(&neg_j_vals).copied().collect();
+                let j_ij = log_sum_exp(&joint) + d_ij;
                 if j_ij <= 0.0 {
                     continue;
                 }
@@ -1142,15 +1140,11 @@ pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f
                 // Coefficient: J_ij / |P| (from d/dx of 0.5 * x^2 = x, times 1/|P|)
                 let coeff = j_ij / count_f;
 
-                // Softmax weights for negatives of i
-                let max_ni = neg_i_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let ni_exps: Vec<f32> = neg_i_vals.iter().map(|&v| (v - max_ni).exp()).collect();
-                let ni_sum: f32 = ni_exps.iter().sum();
-
-                // Softmax weights for negatives of j
-                let max_nj = neg_j_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let nj_exps: Vec<f32> = neg_j_vals.iter().map(|&v| (v - max_nj).exp()).collect();
-                let nj_sum: f32 = nj_exps.iter().sum();
+                // Softmax weights over the joint set of negatives of i and j.
+                let max_n = joint.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let ni_exps: Vec<f32> = neg_i_vals.iter().map(|&v| (v - max_n).exp()).collect();
+                let nj_exps: Vec<f32> = neg_j_vals.iter().map(|&v| (v - max_n).exp()).collect();
+                let joint_sum: f32 = ni_exps.iter().sum::<f32>() + nj_exps.iter().sum::<f32>();
 
                 // Gradient from d_ij term: dL/d(d_ij) = coeff
                 let inv_d_ij = if d_ij > 1e-8 { 1.0 / d_ij } else { 0.0 };
@@ -1161,10 +1155,10 @@ pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f
                     grad[j][d] -= coeff * dd_di;
                 }
 
-                // Gradient from lse_i: d(lse_i)/d(d_ik) = -softmax_weight_ik
+                // Gradient from the joint lse: d(lse)/d(d_ik) = -softmax_weight_ik
                 // so dL/d(d_ik) = coeff * (-w_ik)
                 for (ki, &k) in neg_i_indices.iter().enumerate() {
-                    let w = ni_exps[ki] / ni_sum;
+                    let w = ni_exps[ki] / joint_sum;
                     let d_ik = dists[i][k];
                     let inv_d_ik = if d_ik > 1e-8 { 1.0 / d_ik } else { 0.0 };
                     for d in 0..dim {
@@ -1177,9 +1171,9 @@ pub fn lifted_structured_loss(embeddings: &[&[f32]], labels: &[usize], margin: f
                     }
                 }
 
-                // Gradient from lse_j: d(lse_j)/d(d_jl) = -softmax_weight_jl
+                // Gradient from the joint lse: d(lse)/d(d_jl) = -softmax_weight_jl
                 for (li, &l) in neg_j_indices.iter().enumerate() {
-                    let w = nj_exps[li] / nj_sum;
+                    let w = nj_exps[li] / joint_sum;
                     let d_jl = dists[j][l];
                     let inv_d_jl = if d_jl > 1e-8 { 1.0 / d_jl } else { 0.0 };
                     for d in 0..dim {
@@ -1577,39 +1571,35 @@ pub fn proxy_anchor_loss(
         }
     }
 
-    for c in 0..num_classes {
-        if !classes_present[c] {
-            continue;
-        }
+    // Kim et al. 2020 Eq. 4: the positive term averages over proxies with
+    // positives in the batch (P+), the negative term over all proxies (P).
+    let n_pos_proxies = classes_present.iter().filter(|&&present| present).count();
+    let pos_scale = 1.0 / n_pos_proxies.max(1) as f32;
+    let neg_scale = 1.0 / num_classes as f32;
+    let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
 
+    for c in 0..num_classes {
         let pos_indices: Vec<usize> = (0..n).filter(|&i| labels[i] == c).collect();
         let neg_indices: Vec<usize> = (0..n).filter(|&i| labels[i] != c).collect();
 
-        // Positive term: softplus(-alpha * (logsumexp(alpha * (s - margin)) over positives))
-        // = log(1 + exp(-alpha * lse_pos))
+        // Positive term: log(1 + sum_{x in X+} exp(-alpha * (s - margin))).
         if !pos_indices.is_empty() {
             let pos_logits: Vec<f32> = pos_indices
                 .iter()
-                .map(|&i| alpha * (sims[c][i] - margin))
+                .map(|&i| -alpha * (sims[c][i] - margin))
                 .collect();
             let lse_pos = log_sum_exp(&pos_logits);
-            let sp_arg = -lse_pos; // softplus(-lse)
-            let sp = if sp_arg > 20.0 {
-                sp_arg
-            } else {
-                (1.0 + sp_arg.exp()).ln()
-            };
-            total_loss += sp;
+            total_loss += pos_scale * softplus(lse_pos);
 
-            // Gradient: d(softplus(-lse))/d(s_i) = -sigmoid(-lse) * alpha * softmax_weight_i
-            let sigmoid_neg_lse = 1.0 / (1.0 + lse_pos.exp());
+            // d/ds_i = sigmoid(lse) * softmax_weight_i * (-alpha)
+            let sigmoid_lse = 1.0 / (1.0 + (-lse_pos).exp());
             let max_pl = pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let pos_exps: Vec<f32> = pos_logits.iter().map(|&v| (v - max_pl).exp()).collect();
             let sum_pe: f32 = pos_exps.iter().sum();
 
             for (pi, &i) in pos_indices.iter().enumerate() {
                 let w = pos_exps[pi] / sum_pe;
-                let dsim = -sigmoid_neg_lse * alpha * w;
+                let dsim = -pos_scale * sigmoid_lse * alpha * w;
                 accumulate_cosine_grad(
                     proxies[c],
                     embeddings[i],
@@ -1623,22 +1613,16 @@ pub fn proxy_anchor_loss(
             }
         }
 
-        // Negative term: softplus(alpha * (logsumexp(alpha * (margin + s)) over negatives))
+        // Negative term: log(1 + sum_{x in X-} exp(alpha * (s + margin))).
         if !neg_indices.is_empty() {
             let neg_logits: Vec<f32> = neg_indices
                 .iter()
                 .map(|&i| alpha * (sims[c][i] + margin))
                 .collect();
             let lse_neg = log_sum_exp(&neg_logits);
-            let sp_arg = lse_neg;
-            let sp = if sp_arg > 20.0 {
-                sp_arg
-            } else {
-                (1.0 + sp_arg.exp()).ln()
-            };
-            total_loss += sp;
+            total_loss += neg_scale * softplus(lse_neg);
 
-            // Gradient: d(softplus(lse))/d(s_i) = sigmoid(lse) * alpha * softmax_weight_i
+            // d/ds_i = sigmoid(lse) * softmax_weight_i * alpha
             let sigmoid_lse = 1.0 / (1.0 + (-lse_neg).exp());
             let max_nl = neg_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let neg_exps: Vec<f32> = neg_logits.iter().map(|&v| (v - max_nl).exp()).collect();
@@ -1646,7 +1630,7 @@ pub fn proxy_anchor_loss(
 
             for (ni, &i) in neg_indices.iter().enumerate() {
                 let w = neg_exps[ni] / sum_ne;
-                let dsim = sigmoid_lse * alpha * w;
+                let dsim = neg_scale * sigmoid_lse * alpha * w;
                 accumulate_cosine_grad(
                     proxies[c],
                     embeddings[i],
@@ -1658,19 +1642,6 @@ pub fn proxy_anchor_loss(
                     &mut grad_emb[i],
                 );
             }
-        }
-    }
-
-    let s = 1.0 / num_classes as f32;
-    total_loss *= s;
-    for g in grad_emb.iter_mut() {
-        for v in g.iter_mut() {
-            *v *= s;
-        }
-    }
-    for g in grad_proxy.iter_mut() {
-        for v in g.iter_mut() {
-            *v *= s;
         }
     }
 
