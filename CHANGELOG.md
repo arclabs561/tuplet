@@ -8,6 +8,13 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 - Evaluate multi-similarity loss and gradient weights without overflowing
   intermediate exponentials for finite logits.
+- `proxy_anchor_loss` now follows Kim et al. 2020 Eq. 4: the positive term is
+  `log(1 + sum exp(-alpha (s - delta)))` (it was `log(1 + 1/sum exp(alpha (s - delta)))`),
+  averaged over proxies with positives, and the negative term covers every
+  proxy, averaged over all of them.
+- `lifted_structured_loss` now follows Song et al. 2016 Eq. 4, one
+  log-sum-exp over the negatives of both anchors; it summed two separate
+  log-sum-exps, which is the log of their product. Gradients match.
 
 ## [0.4.0] - 2026-10-09
 
