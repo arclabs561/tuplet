@@ -1,10 +1,11 @@
 # tuplet
 
-Tuple-based metric learning utilities, with selected losses on Burn tensors.
+Tuple-based metric learning utilities.
 
 Contrastive, proxy, and self-supervised losses operate on pairs, triplets, and
-n-tuples of embeddings. Hard-negative mining and classical Mahalanobis distance
-learning (NCA, LMNN, ITML, KISSME) are pure Rust and need no autograd backend.
+n-tuples of embeddings. Three of them also have Burn tensor versions.
+Hard-negative mining and classical Mahalanobis distance learning (NCA, LMNN,
+ITML, KISSME) are pure Rust and need no autograd backend.
 
 ## Install
 
@@ -33,19 +34,10 @@ tuplet = { version = "0.4", features = ["burn-metal"] }
 burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "metal", "fusion"] }
 ```
 
-The default pure-Rust feature set supports Rust 1.85. Any `burn-*` feature in
-Tuplet 0.4 uses Burn 0.22 and requires Rust 1.95. Multiple `burn-*` features may be enabled together; `burn-ndarray`,
-`burn-wgpu`, `burn-tch`, and `burn-cuda` remain available alongside the new
-`burn-flex` and `burn-metal` features.
-
-Tuplet 0.3 uses Burn 0.21; Tuplet 0.4 uses Burn 0.22.
-
-### Burn 0.22 migration
-
-Burn 0.22 dispatches `Tensor<D>` through its runtime device. Replace generic
-`Tensor<B, D>` APIs and `Backend`/`BackendTypes` device plumbing with
-`Tensor<D>` and `Device`. For CPU training use `Device::flex().autodiff()`;
-for Metal use `Device::metal(Default::default()).autodiff()`.
+The default pure-Rust feature set supports Rust 1.85. Any `burn-*` feature uses
+Burn 0.22 and requires Rust 1.95; several `burn-*` features may be enabled
+together. Upgrading from Tuplet 0.3 (Burn 0.21): see
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Losses
 
@@ -131,7 +123,22 @@ let grads = loss.backward();
 
 ## Examples
 
-See [examples/README.md](examples/README.md) for runnable examples with
-captured output.
+`embedding_training` fits an NCA projection, then fine-tunes it with InfoNCE
+and pure-Rust gradients:
+
+```bash
+cargo run --release --example embedding_training
+```
+
+```text
+=== Phase 2: InfoNCE fine-tuning ===
+
+epoch   0: loss=2.8760, 1-NN acc=100.0%
+epoch  10: loss=1.8639, 1-NN acc=100.0%
+epoch  40: loss=1.5491, 1-NN acc=100.0%
+```
+
+See [examples/README.md](examples/README.md) for the other examples and their
+output.
 
 License: MIT OR Apache-2.0
