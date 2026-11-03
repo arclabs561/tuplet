@@ -4,12 +4,15 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 ## Unreleased
 
+## 0.5.0 - 2026-11-03
+
 ### Changed
 
 - `circle_loss` gradients hold the weights `alpha_p` and `alpha_n` constant,
   as the paper specifies and pytorch-metric-learning does. They previously
   differentiated through the weights, which changes the training signal; the
   loss value is unchanged.
+
 ### Fixed
 
 - `vicreg_loss` computes the variance and covariance terms with the unbiased
