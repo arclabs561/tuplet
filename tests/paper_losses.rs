@@ -137,9 +137,9 @@ fn all_slice_losses_match_finite_difference_gradients() {
     errs.extend(fd_check("supcon", vec![e.clone()], &[0], &|g| {
         supcon_loss(&refs(&g[0]), &LABELS, 0.5)
     }));
-    errs.extend(fd_check("circle", vec![e.clone()], &[0], &|g| {
-        circle_loss(&refs(&g[0]), &LABELS, 0.25, 4.0)
-    }));
+    // circle_loss is absent: its gradient holds the alpha weights constant,
+    // as the paper specifies, so it is not the derivative of the loss value.
+    // tests/pml_reference.rs checks it against pytorch-metric-learning.
     errs.extend(fd_check("lifted", vec![e.clone()], &[0], &|g| {
         lifted_structured_loss(&refs(&g[0]), &LABELS, 1.0)
     }));
