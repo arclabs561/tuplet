@@ -19,7 +19,7 @@ keywords = [
 ]
 
 [dependencies]
-innr = { version = "0.4", optional = true }
+innr = { version = "0.6", optional = true }
 rand = { version = "0.9", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 
