@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 ## Unreleased
 
+### Fixed
+
+- `vicreg_loss` computes the variance and covariance terms with the unbiased
+  `1/(n-1)` estimator, as in the paper (Eq. 1 and 3) and its reference code.
+  Loss values for the same batch are slightly larger than before.
+- `kissme` no longer centers pair differences before taking their covariance.
+  The model treats differences as zero-mean, so the learned metric no longer
+  depends on the order of the two points within a pair.
+
 ## 0.4.1 - 2026-10-30
 
 ### Fixed
