@@ -727,25 +727,17 @@ pub fn kissme(
     m
 }
 
-/// Compute covariance matrix of pairwise differences.
+/// Covariance of pairwise differences, `1/|P| sum (a - b)(a - b)^T`.
+///
+/// KISSME models pair differences as zero-mean Gaussians (Koestinger et al.
+/// 2012, Eq. 9-10), so the differences are not centered: subtracting the mean
+/// difference would make the result depend on the order within each pair.
 fn difference_covariance(pairs: &[(&[f32], &[f32])], dim: usize) -> Vec<f32> {
     let n = pairs.len() as f32;
     let mut cov = vec![0.0f32; dim * dim];
 
-    // Compute mean difference
-    let mut mean = vec![0.0f32; dim];
     for &(a, b) in pairs {
-        for i in 0..dim {
-            mean[i] += a[i] - b[i];
-        }
-    }
-    for v in mean.iter_mut() {
-        *v /= n;
-    }
-
-    // Covariance
-    for &(a, b) in pairs {
-        let diff: Vec<f32> = (0..dim).map(|i| (a[i] - b[i]) - mean[i]).collect();
+        let diff: Vec<f32> = (0..dim).map(|i| a[i] - b[i]).collect();
         for i in 0..dim {
             for j in 0..dim {
                 cov[i * dim + j] += diff[i] * diff[j];

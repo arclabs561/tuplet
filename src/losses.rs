@@ -1440,18 +1440,22 @@ pub fn vicreg_loss(
         mean_b[d] /= n as f32;
     }
 
+    // Variance and covariance use the unbiased 1/(n-1) estimator, as in the
+    // paper's Eq. 3 and its reference implementation.
+    let denom = (n - 1) as f32;
+
     // === Variance: hinge on std dev ===
     // var_loss = (1/dim) * sum_d max(0, 1 - std_d)
     let variance_loss = |view: &[&[f32]], mean: &[f32], grad: &mut [Vec<f32>]| -> f32 {
         let mut loss = 0.0f32;
         for d in 0..dim {
-            let var: f32 = (0..n).map(|i| (view[i][d] - mean[d]).powi(2)).sum::<f32>() / n as f32;
+            let var: f32 = (0..n).map(|i| (view[i][d] - mean[d]).powi(2)).sum::<f32>() / denom;
             let std = (var + 1e-4).sqrt();
             let hinge = (1.0 - std).max(0.0);
             loss += hinge;
             if hinge > 0.0 {
-                // d(max(0,1-std))/d(x_i) = -(1/(2*std)) * 2*(x_i - mean)/n
-                let dstd_coeff = -1.0 / (2.0 * std * n as f32);
+                // d(max(0,1-std))/d(x_i) = -(1/(2*std)) * 2*(x_i - mean)/(n-1)
+                let dstd_coeff = -1.0 / (2.0 * std * denom);
                 for i in 0..n {
                     grad[i][d] += mu_var * dstd_coeff * 2.0 * (view[i][d] - mean[d]) / dim as f32;
                 }
@@ -1477,7 +1481,7 @@ pub fn vicreg_loss(
         }
         for row in cov.iter_mut() {
             for v in row.iter_mut() {
-                *v /= n as f32;
+                *v /= denom;
             }
         }
 
@@ -1492,9 +1496,9 @@ pub fn vicreg_loss(
         loss /= dim as f32;
 
         // Gradient: d(cov_loss)/d(x_k[d1])
-        // = (2/dim) * sum_{d2 != d1} cov[d1][d2] * (x_k[d2] - mean[d2]) / n
-        // + (2/dim) * sum_{d2 != d1} cov[d2][d1] * (x_k[d2] - mean[d2]) / n  (symmetry)
-        // Since cov is symmetric: = (4/dim) * sum_{d2 != d1} cov[d1][d2] * (x_k[d2] - mean[d2]) / n
+        // = (2/dim) * sum_{d2 != d1} cov[d1][d2] * (x_k[d2] - mean[d2]) / (n-1)
+        // + (2/dim) * sum_{d2 != d1} cov[d2][d1] * (x_k[d2] - mean[d2]) / (n-1)  (symmetry)
+        // Since cov is symmetric: = (4/dim) * sum_{d2 != d1} cov[d1][d2] * (x_k[d2] - mean[d2]) / (n-1)
         for k in 0..n {
             for d1 in 0..dim {
                 let mut g = 0.0f32;
@@ -1503,7 +1507,7 @@ pub fn vicreg_loss(
                         g += cov[d1][d2] * (view[k][d2] - mean[d2]);
                     }
                 }
-                grad[k][d1] += nu_cov * 4.0 * g / (dim as f32 * n as f32);
+                grad[k][d1] += nu_cov * 4.0 * g / (dim as f32 * denom);
             }
         }
 

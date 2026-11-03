@@ -278,3 +278,95 @@ fn lifted_structured_matches_song_2016_eq4() {
         "lifted_structured_loss = {got}, Song et al. Eq. 4 = {expected}"
     );
 }
+
+/// Bardes et al. 2022 Eq. 3-4: covariance C(Z) = 1/(n-1) sum (z - mean)(z - mean)^T.
+/// Checked with lambda = mu = 0 so only the covariance term remains.
+#[test]
+fn vicreg_covariance_uses_unbiased_estimator() {
+    let a = data(4, 3, 31);
+    let b = data(4, 3, 32);
+    let cov_term = |z: &[Vec<f32>]| -> f64 {
+        let n = z.len();
+        let dim = z[0].len();
+        let mean: Vec<f64> = (0..dim)
+            .map(|d| z.iter().map(|x| x[d] as f64).sum::<f64>() / n as f64)
+            .collect();
+        let mut c = 0.0;
+        for d1 in 0..dim {
+            for d2 in 0..dim {
+                if d1 != d2 {
+                    let v: f64 = z
+                        .iter()
+                        .map(|x| (x[d1] as f64 - mean[d1]) * (x[d2] as f64 - mean[d2]))
+                        .sum::<f64>()
+                        / (n as f64 - 1.0);
+                    c += v * v;
+                }
+            }
+        }
+        c / dim as f64
+    };
+    let expected = cov_term(&a) + cov_term(&b);
+    let got = vicreg_loss(&refs(&a), &refs(&b), 0.0, 0.0, 1.0).loss;
+    assert!(
+        (got as f64 - expected).abs() < 1e-4 * expected.max(1.0),
+        "vicreg covariance term = {got}, paper (1/(n-1)) = {expected}"
+    );
+}
+
+/// KISSME (Koestinger et al. 2012, Eq. 9-10) models pair differences as zero-mean
+/// Gaussians: Sigma_S = 1/|S| sum (x_i - x_j)(x_i - x_j)^T. That is invariant to the
+/// orientation of each pair; centering by the mean difference is not.
+#[test]
+fn kissme_is_invariant_to_pair_orientation() {
+    let x = data(16, 3, 41);
+    let sim: Vec<(&[f32], &[f32])> = (0..4)
+        .map(|i| (x[2 * i].as_slice(), x[2 * i + 1].as_slice()))
+        .collect();
+    let dis: Vec<(&[f32], &[f32])> = (4..8)
+        .map(|i| (x[2 * i].as_slice(), x[2 * i + 1].as_slice()))
+        .collect();
+    let sim_flipped: Vec<(&[f32], &[f32])> = sim
+        .iter()
+        .enumerate()
+        .map(|(k, &(a, b))| if k % 2 == 0 { (b, a) } else { (a, b) })
+        .collect();
+    let m1 = kissme(&sim, &dis, 3);
+    let m2 = kissme(&sim_flipped, &dis, 3);
+    let diff: f32 = m1
+        .iter()
+        .zip(&m2)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        diff < 1e-3 * m1.iter().map(|v| v.abs()).fold(1.0, f32::max),
+        "max |M - M_flipped| = {diff}\n{m1:?}\n{m2:?}"
+    );
+}
+
+/// Bardes et al. 2022 Eq. 1: v(Z) = 1/d sum_j max(0, 1 - S(z^j, eps)), with S the
+/// standard deviation sqrt(Var + eps) over the unbiased 1/(n-1) variance.
+/// Checked with lambda = nu = 0 so only the variance term remains.
+#[test]
+fn vicreg_variance_uses_unbiased_estimator() {
+    let a = data(4, 3, 33);
+    let b = data(4, 3, 34);
+    let var_term = |z: &[Vec<f32>]| -> f64 {
+        let n = z.len() as f64;
+        let dim = z[0].len();
+        let mut v = 0.0;
+        for d in 0..dim {
+            let mean = z.iter().map(|x| x[d] as f64).sum::<f64>() / n;
+            let var = z.iter().map(|x| (x[d] as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0);
+            v += (1.0 - (var + 1e-4).sqrt()).max(0.0);
+        }
+        v / dim as f64
+    };
+    let expected = var_term(&a) + var_term(&b);
+    assert!(expected > 0.0, "fixture must keep the hinge active");
+    let got = vicreg_loss(&refs(&a), &refs(&b), 0.0, 1.0, 0.0).loss;
+    assert!(
+        (got as f64 - expected).abs() < 1e-4 * expected.max(1.0),
+        "vicreg variance term = {got}, paper (1/(n-1)) = {expected}"
+    );
+}
