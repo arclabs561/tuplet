@@ -314,6 +314,36 @@ fn vicreg_covariance_uses_unbiased_estimator() {
     );
 }
 
+/// KISSME (Koestinger et al. 2012, Eq. 9-10) models pair differences as zero-mean
+/// Gaussians: Sigma_S = 1/|S| sum (x_i - x_j)(x_i - x_j)^T. That is invariant to the
+/// orientation of each pair; centering by the mean difference is not.
+#[test]
+fn kissme_is_invariant_to_pair_orientation() {
+    let x = data(16, 3, 41);
+    let sim: Vec<(&[f32], &[f32])> = (0..4)
+        .map(|i| (x[2 * i].as_slice(), x[2 * i + 1].as_slice()))
+        .collect();
+    let dis: Vec<(&[f32], &[f32])> = (4..8)
+        .map(|i| (x[2 * i].as_slice(), x[2 * i + 1].as_slice()))
+        .collect();
+    let sim_flipped: Vec<(&[f32], &[f32])> = sim
+        .iter()
+        .enumerate()
+        .map(|(k, &(a, b))| if k % 2 == 0 { (b, a) } else { (a, b) })
+        .collect();
+    let m1 = kissme(&sim, &dis, 3);
+    let m2 = kissme(&sim_flipped, &dis, 3);
+    let diff: f32 = m1
+        .iter()
+        .zip(&m2)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(
+        diff < 1e-3 * m1.iter().map(|v| v.abs()).fold(1.0, f32::max),
+        "max |M - M_flipped| = {diff}\n{m1:?}\n{m2:?}"
+    );
+}
+
 /// Bardes et al. 2022 Eq. 1: v(Z) = 1/d sum_j max(0, 1 - S(z^j, eps)), with S the
 /// standard deviation sqrt(Var + eps) over the unbiased 1/(n-1) variance.
 /// Checked with lambda = nu = 0 so only the variance term remains.
