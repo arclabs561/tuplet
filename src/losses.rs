@@ -819,6 +819,10 @@ pub fn supcon_loss(embeddings: &[&[f32]], labels: &[usize], temperature: f32) ->
 ///
 /// Unified pair similarity optimization with adaptive per-pair weighting.
 /// `margin` controls the decision boundary, `gamma` is a scale factor.
+///
+/// The returned gradients hold the weights `alpha_p = [1 + m - s_p]+` and
+/// `alpha_n = [s_n + m]+` constant, as the paper specifies, so they are not
+/// the derivative of the returned loss value.
 pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: f32) -> LossOutput {
     let n = embeddings.len();
     assert_eq!(n, labels.len());
@@ -895,16 +899,13 @@ pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: 
 
     total_loss /= n as f32;
 
-    // Gradients with full alpha dependency (not detached).
-    // This computes the true gradient of the implemented function. Note: pytorch-metric-learning
-    // detaches alpha (treats it as constant during backprop), which is a practical choice from
-    // the paper but not mathematically required. The candle_losses module detaches alpha to
-    // match the reference implementation; this f32 module computes the exact gradient.
+    // Gradients treat the weights alpha as constants, as the paper specifies
+    // (Sun et al. 2020, Sec. 3.1: the gradient with respect to alpha * s is
+    // multiplied by alpha when backpropagated to s) and as the reference
+    // implementations do. This is not the derivative of the loss value.
     //
-    // logit_n = gamma * max(0, s_n - O_n) * (s_n - delta_n)
-    // When alpha_n > 0: d(logit_n)/d(s_n) = gamma * (2*s_n - delta_n - O_n)
-    // logit_p = -gamma * max(0, O_p - s_p) * (s_p - delta_p)
-    // When alpha_p > 0: d(logit_p)/d(s_p) = -gamma * (O_p - 2*s_p + delta_p)
+    // logit_n = gamma * alpha_n * (s_n - delta_n), so d(logit_n)/d(s_n) = gamma * alpha_n
+    // logit_p = -gamma * alpha_p * (s_p - delta_p), so d(logit_p)/d(s_p) = -gamma * alpha_p
     //
     // dL/d(s) = sigmoid(combined) * softmax_weight * d(logit)/d(s)
     // Then chain through d(cosine)/d(embedding).
@@ -972,7 +973,7 @@ pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: 
             if alpha_n == 0.0 {
                 continue;
             }
-            let dlogit_ds = gamma * (2.0 * s_n - delta_n - o_n);
+            let dlogit_ds = gamma * alpha_n;
             let w_n = (neg_logits[ni] - max_neg).exp() / sum_exp_neg;
             let dsim = sigmoid_c * w_n * dlogit_ds * scale;
 
@@ -999,7 +1000,7 @@ pub fn circle_loss(embeddings: &[&[f32]], labels: &[usize], margin: f32, gamma: 
             if alpha_p == 0.0 {
                 continue;
             }
-            let dlogit_ds = -gamma * (o_p - 2.0 * s_p + delta_p);
+            let dlogit_ds = -gamma * alpha_p;
             let w_p = (pos_logits[pi] - max_pos).exp() / sum_exp_pos;
             let dsim = sigmoid_c * w_p * dlogit_ds * scale;
 
@@ -2271,9 +2272,39 @@ mod tests {
         let refs: Vec<&[f32]> = embeddings.iter().map(|e| e.as_slice()).collect();
         let out = circle_loss(&refs, &labels, margin, gamma);
 
+        // The returned gradient holds alpha constant (Sun et al. 2020, Sec.
+        // 3.1), so it is the derivative of the loss with alpha frozen at the
+        // starting similarities, not of the loss value itself.
+        let cos = |a: &[f32], b: &[f32]| dot(a, b) / (dot(a, a).sqrt() * dot(b, b).sqrt());
+        let lse = |v: &[f32]| {
+            let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln()
+        };
+        let frozen_alpha_loss = |embs: &[&[f32]]| {
+            let n = embs.len();
+            let mut total = 0.0;
+            for i in 0..n {
+                let (mut pos, mut neg) = (vec![], vec![]);
+                for j in (0..n).filter(|&j| j != i) {
+                    let (s, s0) = (cos(embs[i], embs[j]), cos(refs[i], refs[j]));
+                    if labels[j] == labels[i] {
+                        pos.push(-gamma * (1.0 + margin - s0).max(0.0) * (s - (1.0 - margin)));
+                    } else {
+                        neg.push(gamma * (s0 + margin).max(0.0) * (s - margin));
+                    }
+                }
+                total += (1.0 + (lse(&neg) + lse(&pos)).exp()).ln();
+            }
+            total / n as f32
+        };
+        assert!(
+            (frozen_alpha_loss(&refs) - out.loss).abs() < 1e-5,
+            "surrogate must equal the loss at the starting point"
+        );
+
         check_numerical_gradients_batch(
             &embeddings,
-            |embs| circle_loss(embs, &labels, margin, gamma).loss,
+            frozen_alpha_loss,
             &out.grad_anchors,
             1e-4,
             5e-2,

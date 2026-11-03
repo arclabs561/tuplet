@@ -62,9 +62,6 @@ CASES = [
      lambda: losses.MultiSimilarityLoss(alpha=2, beta=50, base=0.5), False),
     ("supcon", "supcon_loss(&emb, &LABELS, 0.1)",
      lambda: losses.SupConLoss(temperature=0.1), False),
-    # Value only: pml detaches the alpha weights (as the paper's gradient
-    # specifies), while tuplet's f32 circle_loss returns the exact gradient of
-    # the loss as written, so the gradients differ by design.
     ("circle", "circle_loss(&emb, &LABELS, 0.25, 32.0)",
      lambda: losses.CircleLoss(margin=0.25, gamma=32), False),
     ("proxy_anchor", "proxy_anchor_loss(&emb, &LABELS, &proxies, 0.1, 32.0)",
@@ -115,12 +112,8 @@ fn check(name: &str, out: LossOutput, loss: f32, grad_emb: &[[f32; {D}]], grad_p
 
 for name, call, make, proxy in CASES:
     loss, ge, gp = run(make, proxy)
-    if name == "circle":
-        ge = []
     gp_rows = f"[\n{rows(gp, '            ')}\n        ]" if gp is not None else "[]"
-    doc = ("\n/// Loss value only: pml detaches the alpha weights, as the paper's gradient\n"
-           "/// specifies; tuplet's f32 circle_loss returns the exact gradient.") if name == "circle" else ""
-    print(f"""{doc}
+    print(f"""
 #[test]
 fn {name}_matches_pml() {{
     let emb: Vec<&[f32]> = EMB.iter().map(|v| v.as_slice()).collect();

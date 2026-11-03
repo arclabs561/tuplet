@@ -100,8 +100,6 @@ fn supcon_matches_pml() {
     );
 }
 
-/// Loss value only: pml detaches the alpha weights, as the paper's gradient
-/// specifies; tuplet's f32 circle_loss returns the exact gradient.
 #[test]
 fn circle_matches_pml() {
     let emb: Vec<&[f32]> = EMB.iter().map(|v| v.as_slice()).collect();
@@ -111,7 +109,16 @@ fn circle_matches_pml() {
         "circle",
         circle_loss(&emb, &LABELS, 0.25, 32.0),
         89.915665,
-        &[],
+        &[
+            [1.0689849, 4.980974, -1.4733537, 4.8242455],
+            [0.24569155, 4.724294, -4.777014, 8.59033],
+            [-1.8256644, -5.9663634, 1.1844811, -2.6694522],
+            [-1.4886354, -9.51052, 10.003413, 3.9374256],
+            [-12.73784, 6.3177953, 0.6730931, -0.10174697],
+            [-5.547641, 3.4933152, -4.258452, 2.580856],
+            [-10.700498, -1.230078, 5.333313, 10.5934725],
+            [6.1735907, -8.633098, 0.30448782, 4.487404],
+        ],
         &[],
     );
 }
