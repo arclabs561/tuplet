@@ -12,7 +12,7 @@ ITML, KISSME) are pure Rust and need no autograd backend.
 ```toml
 [dependencies]
 # Pure-Rust features only:
-tuplet = "0.4"
+tuplet = "0.5"
 ```
 
 For an application that uses Burn tensors, enable any required Tuplet runtime
@@ -21,7 +21,7 @@ the Rust code below:
 
 ```toml
 [dependencies]
-tuplet = { version = "0.4", features = ["burn-flex"] }
+tuplet = { version = "0.5", features = ["burn-flex"] }
 burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "flex"] }
 ```
 
@@ -30,7 +30,7 @@ For Metal, replace `burn-flex` / `flex` with `burn-metal` / `metal`, and add
 
 ```toml
 [dependencies]
-tuplet = { version = "0.4", features = ["burn-metal"] }
+tuplet = { version = "0.5", features = ["burn-metal"] }
 burn = { version = "0.22.0", default-features = false, features = ["std", "autodiff", "metal", "fusion"] }
 ```
 
