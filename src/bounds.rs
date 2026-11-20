@@ -7,21 +7,27 @@
 //!
 //! Folded from the (archived) ritu crate.
 
-/// Project a flat-row-major `n x n` distance matrix onto the metric cone via
-/// Floyd-Warshall-style triangle propagation. Single pass. O(n^3).
+/// Project a flat-row-major `n x n` distance matrix onto the metric cone by
+/// replacing every entry with the shortest-path distance (Floyd-Warshall).
+/// O(n^3).
 ///
-/// Lighter than a full quadratic program but only correct as a one-shot
-/// fix-up; iterate to convergence if you need a stricter guarantee.
+/// The result satisfies `d(i, k) <= d(i, j) + d(j, k)` for every triple, and
+/// a symmetric input stays symmetric. Entries only decrease. This is the
+/// largest metric below the input, not the nearest one in a least-squares
+/// sense.
 pub fn project_triangle_inequality(dists: &mut [f64], n: usize) {
     debug_assert_eq!(dists.len(), n * n);
-    for i in 0..n {
-        for j in 0..n {
+    // The intermediate vertex must be the outermost loop: after iteration `j`,
+    // every entry is the shortest path using intermediates `0..=j`. With `j`
+    // inside, a pair is relaxed through vertices whose own entries are not
+    // final yet, which left violations and broke symmetry.
+    for j in 0..n {
+        for i in 0..n {
+            let d_ij = dists[i * n + j];
             for k in 0..n {
-                let d_ij = dists[i * n + j];
-                let d_jk = dists[j * n + k];
-                let d_ik = dists[i * n + k];
-                if d_ik > d_ij + d_jk {
-                    dists[i * n + k] = d_ij + d_jk;
+                let via = d_ij + dists[j * n + k];
+                if dists[i * n + k] > via {
+                    dists[i * n + k] = via;
                 }
             }
         }
@@ -48,6 +54,44 @@ mod tests {
         project_triangle_inequality(&mut d, 3);
         for (a, b) in d.iter().zip(original.iter()) {
             assert!((a - b).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn random_symmetric_inputs_become_symmetric_metrics() {
+        // xorshift; no dev-dependency needed.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1000) as f64 / 100.0 + 0.01
+        };
+        for n in [3usize, 4, 5, 7] {
+            for _ in 0..2000 {
+                let mut d = vec![0.0; n * n];
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        let v = next();
+                        d[i * n + j] = v;
+                        d[j * n + i] = v;
+                    }
+                }
+                let before = d.clone();
+                project_triangle_inequality(&mut d, n);
+                for i in 0..n {
+                    for j in 0..n {
+                        assert!((d[i * n + j] - d[j * n + i]).abs() < 1e-12, "asymmetric");
+                        assert!(d[i * n + j] <= before[i * n + j] + 1e-12, "entry grew");
+                        for k in 0..n {
+                            assert!(
+                                d[i * n + k] <= d[i * n + j] + d[j * n + k] + 1e-9,
+                                "triangle violated"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }
