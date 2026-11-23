@@ -4,11 +4,11 @@ All notable changes to this project are documented here. Format based on [Keep a
 
 ## Unreleased
 
-## 0.6.0
+## 0.5.1
 
 ### Fixed
 
-- Triangle projection computes the full shortest-path closure for symmetric distance matrices. The optional Burn backends use Burn 0.22 and require Rust 1.95.
+- Triangle projection computes the full shortest-path closure for symmetric distance matrices.
 
 ## 0.5.0 - 2026-11-03
 
