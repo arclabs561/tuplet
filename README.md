@@ -39,6 +39,17 @@ Burn 0.22 and requires Rust 1.95; several `burn-*` features may be enabled
 together. Upgrading from Tuplet 0.3 (Burn 0.21): see
 [CHANGELOG.md](CHANGELOG.md).
 
+### Reproduce the Burn 0.22.1 CPU check
+
+If the registry does not yet offer Tuplet 0.5.1, use the tested source
+revision. This pair ran forward and backward on Flex with Rust 1.95:
+
+```toml
+[dependencies]
+tuplet = { git = "https://github.com/arclabs561/tuplet", rev = "b415204bf5962057f0752103e9e3d25c812da603", default-features = false, features = ["burn-flex"] }
+burn = { version = "=0.22.1", default-features = false, features = ["std", "autodiff", "flex"] }
+```
+
 ## Losses
 
 The Burn implementations of triplet, contrastive, and InfoNCE losses operate on
